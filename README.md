@@ -8,7 +8,9 @@ Repository for Superagent tasks.
 casting renderer with a real software 3D pipeline: model, view and projection
 transforms, near-plane clipping, perspective divide, depth-buffered triangle
 rasterization, perspective-correct texture mapping with mip levels, directional
-lighting and distance fog. The museum map, zombie combat and controls from the
+lighting with Blinn-Phong specular highlights, distance fog and 2x2 supersampled
+anti-aliasing. Soft, alpha-blended shadows and particles keep effects from
+looking like hard cut-outs. The museum map, zombie combat and controls from the
 old demo are preserved, two drivable cars have been added to the map, and the
 game now revolves around a signature **Shift dash** plus speed-scaled
 vehicle-versus-zombie combat.
@@ -114,9 +116,9 @@ python3 tools/ppm_to_png.py frame.ppm frame.png
 `make screenshots` regenerates the five images above; the PNG converter uses
 only the Python standard library. `--dash` and `--impact` run the real update
 loop for a few frames before capturing, so they show live simulation state
-rather than a posed frame. Rendering a 960x540 frame takes roughly 0.2 s on a
-current laptop CPU, and interactive frames use the much smaller terminal
-resolution.
+rather than a posed frame. Rendering a 960x540 frame takes roughly 0.7 s with
+2x2 anti-aliasing (about 0.2 s without). Interactive frames use the much
+smaller terminal resolution, so the same sampling stays cheap there.
 
 Useful options (also listed by `./game3d --help`):
 
@@ -144,11 +146,17 @@ Useful options (also listed by `./game3d --help`):
   the near plane in view space. Clipped polygons are fan-triangulated, projected
   to the viewport and rasterized with an edge-function scan converter. A
   reciprocal-w depth buffer resolves occlusion, while `1/w`-weighted
-  interpolation keeps world position, normals and UVs perspective-correct.
+  interpolation keeps world position, normals, UVs and coverage
+  perspective-correct. The frame is rendered at twice the output resolution and
+  resolved with a box filter, which anti-aliases every triangle, texture and
+  billboard edge. Opaque geometry is drawn first; materials below full opacity
+  (soft ground shadows, particles, the blood pool) blend in a depth-tested
+  transparent pass without writing depth.
 - **Textures and lighting.** Materials sample tiling procedural textures
   (brick, stone, painted panels, wood, gold, water, floor and ceiling) with
   bilinear filtering and an automatically generated mip chain. A directional
-  light, ambient term and small ceiling bounce term shade each pixel, and
+  light, ambient term and small ceiling bounce term shade each pixel, a
+  Blinn-Phong highlight gives paint, metal, stone and water a sheen, and
   distance fog fades the far end of the museum.
 - **Map.** The original 24x24 grid with five wall materials is unchanged. It is
   extruded into 3D: exposed wall faces are generated per grid cell, wall tops
@@ -169,14 +177,14 @@ Useful options (also listed by `./game3d --help`):
   lasts zombie melee is ignored, which makes dashing through an incoming attack
   the main defensive technique.
 - **Vehicles.** Two cars are parked in the atrium. Each is built from boxes and
-  twelve-sided wheel cylinders, with paint, glass, headlights, tail lights and a
-  ground shadow. Driving uses an arcade bicycle model: throttle acceleration,
-  braking, reverse, drag, speed-sensitive steering and a speed cap. Front wheels
-  steer and all wheels spin. Collision uses a two-circle hull against the grid:
-  blocked movement slides along walls, frontal impacts damp the speed, turning
-  into a wall is rejected, cars cannot overlap each other, and zombies are
-  pushed out of a car's hull. The chase camera shortens its boom when a wall is
-  behind the car, so it stays inside the museum.
+  twelve-sided wheel cylinders, with glossy paint, glass, headlights, tail lights
+  and a soft alpha-blended ground shadow. Driving uses an arcade bicycle model:
+  throttle acceleration, braking, reverse, drag, speed-sensitive steering and a
+  speed cap. Front wheels steer and all wheels spin. Collision uses a two-circle
+  hull against the grid: blocked movement slides along walls, frontal impacts
+  damp the speed, turning into a wall is rejected, cars cannot overlap each
+  other, and zombies are pushed out of a car's hull. The chase camera shortens
+  its boom when a wall is behind the car, so it stays inside the museum.
 - **Vehicle combat.** Every moving car tests its hull against living zombies.
   The impact damage is `10 + 26 * (speed - 1)` and the knockback impulse grows
   with speed. High-speed hits set the zombie's `flattened` ragdoll flag; all
@@ -184,10 +192,13 @@ Useful options (also listed by `./game3d --help`):
   cooldown prevents one contact from draining a whole health bar over several
   frames.
 - **Effects.** Blood and dust are short-lived billboard particles with gravity
-  and drag; dash dust and the speed streak layer add the sense of a burst.
-  Camera shake is applied to the view matrix, and a radial multi-tap blur is
-  applied to the frame buffer while the dash is active. Audio is the terminal
-  bell, queued as simulation events so the renderer and tests stay deterministic.
+  and drag, rendered as soft round sprites that fade out; dash dust and the speed
+  streak layer add the sense of a burst. Ground shadows under cars and zombies
+  use the same alpha falloff, so they blend into the floor instead of reading as
+  dark discs. Camera shake is applied to the view matrix, and a radial multi-tap
+  blur is applied to the frame buffer while the dash is active. Audio is the
+  terminal bell, queued as simulation events so the renderer and tests stay
+  deterministic.
 - **Gameplay rays.** The renderer no longer uses ray casting. A grid DDA routine
   remains in the simulation for line-of-sight checks, zombie hitscan and
   third-person camera clearance; it never produces pixels.
@@ -204,11 +215,12 @@ make test
 
 The built-in selftest checks matrix/projection math, texture sampling and mip
 levels, rasterization, depth buffering, back-face culling, near-plane clipping,
-map and spawn invariants, 1200 random gameplay rays against a brute-force march,
-zombie hitscan/occlusion/chase/melee/respawn behaviour, vehicle entry/exit,
-acceleration, braking, reverse, steering, speed caps, wall and car collisions,
-dash burst speed/cooldown/invulnerability/kills/score, speed-scaled vehicle
-damage, knockback, ragdoll flattening, particle effects, respawn cleanup,
+2x2 supersampling, specular highlights and alpha blending, map and spawn
+invariants, 1200 random gameplay rays against a brute-force march, zombie
+hitscan/occlusion/chase/melee/respawn behaviour, vehicle entry/exit, acceleration,
+braking, reverse, steering, speed caps, wall and car collisions, dash burst
+speed/cooldown/invulnerability/kills/score, speed-scaled vehicle damage,
+knockback, ragdoll flattening, particle effects, respawn cleanup,
 first-person/chase/overhead rendering, zombie depth occlusion and PPM output.
 
 The project builds cleanly with `-Wall -Wextra -Wpedantic -Werror`. The GitHub

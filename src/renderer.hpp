@@ -4,7 +4,9 @@
 // view and projection transforms, near-plane clipping, perspective divide,
 // viewport mapping, depth-buffered triangle rasterization with perspective
 // correct attribute interpolation, texture sampling with mip levels, and
-// per-pixel directional lighting plus distance fog.
+// per-pixel directional lighting, specular highlights and distance fog.
+// Supersampled anti-aliasing renders the scene at a higher resolution and
+// resolves it down with a box filter.
 #pragma once
 
 #include <cstdint>
@@ -101,6 +103,10 @@ struct Vertex {
     Vec3 position;
     Vec3 normal{0.0, 0.0, 1.0};
     Vec2 uv;
+    // Per-vertex coverage used for soft shadows and particles.  It is
+    // interpolated across the triangle and multiplied by the material
+    // opacity to blend the fragment over the frame.
+    double alpha = 1.0;
 };
 
 struct Triangle {
@@ -126,6 +132,13 @@ struct Material {
     Color tint = makeColor(255, 255, 255);
     bool unlit = false;
     bool doubleSided = false;
+    // Blinn-Phong highlight strength (0 = matte) and its exponent: higher
+    // exponents produce a tighter, glossier highlight.
+    double specular = 0.0;
+    double shininess = 32.0;
+    // Materials below full opacity are rendered in a transparent pass after
+    // the opaque geometry, so soft shadows and particles blend over the scene.
+    double opacity = 1.0;
 };
 
 struct DrawItem {
@@ -160,6 +173,9 @@ struct Scene {
     double fogStart = 16.0;
     double fogEnd = 60.0;
     double fogMaximum = 0.7;
+    // 1 = no anti-aliasing, 2 = 2x2 supersampling, and so on.  Very large
+    // frames are automatically reduced to keep the sample buffer bounded.
+    int supersamples = 2;
 };
 
 void renderScene(Image& image, const Scene& scene);

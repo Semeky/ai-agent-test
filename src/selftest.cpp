@@ -245,6 +245,72 @@ bool selftestRasterizer(std::string& error) {
     return true;
 }
 
+bool selftestRenderQuality(std::string& error) {
+    // 2x2 supersampling must smooth the diagonal edges of a triangle.
+    Mesh triangleMesh;
+    addTestTriangle(triangleMesh, -3.0, false);
+    Scene aliased = makeSimpleScene(triangleMesh, makeColor(220, 40, 30));
+    aliased.supersamples = 1;
+    Image aliasedFrame(64, 64);
+    renderScene(aliasedFrame, aliased);
+    Scene smoothed = aliased;
+    smoothed.supersamples = 2;
+    Image smoothedFrame(64, 64);
+    renderScene(smoothedFrame, smoothed);
+    if (uniqueColorCount(aliasedFrame) != 2) {
+        error = "the un-antialiased reference frame has edge colors";
+        return false;
+    }
+    if (uniqueColorCount(smoothedFrame) <= uniqueColorCount(aliasedFrame)) {
+        error = "supersampling did not blend edge coverage";
+        return false;
+    }
+
+    // A Blinn-Phong highlight must brighten a surface facing the light.
+    Mesh quad;
+    quad.addQuad(Vec3{-2.0, -2.0, -3.0}, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0},
+                 4.0, 4.0, Vec2{0.0, 0.0}, Vec2{1.0, 1.0});
+    Scene lit = makeSimpleScene(quad, makeColor(100, 100, 100));
+    lit.supersamples = 1;
+    lit.skyTop = lit.skyBottom = makeColor(0, 0, 0);
+    lit.ambient = 0.0;
+    lit.fogMaximum = 0.0;
+    lit.light.towardLight = Vec3{0.0, 0.0, 1.0};
+    lit.light.color = makeColor(255, 255, 255);
+    lit.light.intensity = 1.0;
+    lit.items[0].material.unlit = false;
+    lit.items[0].material.specular = 0.5;
+    lit.items[0].material.shininess = 8.0;
+    Image litFrame(64, 64);
+    renderScene(litFrame, lit);
+    const int matte = 100;
+    if (litFrame.at(32, 32).r < matte + 40) {
+        error = "a specular highlight does not brighten a lit surface";
+        return false;
+    }
+    lit.items[0].material.specular = 0.0;
+    Image matteFrame(64, 64);
+    renderScene(matteFrame, lit);
+    if (matteFrame.at(32, 32).r > matte + 4) {
+        error = "a matte material still produces a specular highlight";
+        return false;
+    }
+
+    // A half-opacity material must blend over the frame behind it.
+    Scene overlay = makeSimpleScene(quad, makeColor(255, 255, 255));
+    overlay.supersamples = 1;
+    overlay.skyTop = overlay.skyBottom = makeColor(200, 0, 0);
+    overlay.items[0].material.opacity = 0.5;
+    Image overlayFrame(64, 64);
+    renderScene(overlayFrame, overlay);
+    const Color blended = overlayFrame.at(32, 32);
+    if (blended.g < 90 || blended.g > 165 || blended.r < 210) {
+        error = "a transparent material is not blended over the frame";
+        return false;
+    }
+    return true;
+}
+
 bool selftestMap(const Grid& map, std::string& error) {
     for (int x = 0; x < kMapWidth; ++x) {
         if (map[0][x] == 0 || map[kMapHeight - 1][x] == 0) {
@@ -1036,6 +1102,12 @@ bool runSelftest(const Grid& map) {
         std::printf("  [ok] pipeline: rasterization, depth buffer, culling, near clip\n");
     } else {
         std::printf("  [FAIL] pipeline: %s\n", error.c_str());
+        ++failures;
+    }
+    if (selftestRenderQuality(error)) {
+        std::printf("  [ok] render quality: supersampling, specular, transparency\n");
+    } else {
+        std::printf("  [FAIL] render quality: %s\n", error.c_str());
         ++failures;
     }
     if (selftestMap(map, error)) {

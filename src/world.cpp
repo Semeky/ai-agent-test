@@ -757,17 +757,18 @@ Texture makeWaterTexture() {
     return Texture(size, size, std::move(pixels));
 }
 
-Mesh makeDiscMesh(int segments) {
+Mesh makeDiscMesh(int segments, double rimAlpha = 1.0, double radius = 1.0) {
     Mesh mesh;
     const Vec3 normal{0.0, 0.0, 1.0};
     const Vec2 uv{0.5, 0.5};
     for (int i = 0; i < segments; ++i) {
         const double a0 = 2.0 * kPi * static_cast<double>(i) / segments;
         const double a1 = 2.0 * kPi * static_cast<double>(i + 1) / segments;
-        const Vec3 p0{std::cos(a0), std::sin(a0), 0.0};
-        const Vec3 p1{std::cos(a1), std::sin(a1), 0.0};
-        mesh.addTriangle(Vertex{Vec3{0.0, 0.0, 0.0}, normal, uv},
-                         Vertex{p0, normal, uv}, Vertex{p1, normal, uv});
+        const Vec3 p0{std::cos(a0) * radius, std::sin(a0) * radius, 0.0};
+        const Vec3 p1{std::cos(a1) * radius, std::sin(a1) * radius, 0.0};
+        mesh.addTriangle(Vertex{Vec3{0.0, 0.0, 0.0}, normal, uv, 1.0},
+                         Vertex{p0, normal, uv, rimAlpha},
+                         Vertex{p1, normal, uv, rimAlpha});
     }
     return mesh;
 }
@@ -811,13 +812,17 @@ Color vehiclePaint(int id) {
 }
 
 void addPart(Scene& scene, const Mesh& mesh, const Mat4& model, Color color,
-             bool unlit = false, const Texture* texture = nullptr) {
+             bool unlit = false, const Texture* texture = nullptr,
+             double specular = 0.0, double shininess = 32.0, double opacity = 1.0) {
     DrawItem item;
     item.mesh = &mesh;
     item.model = model;
     item.material.tint = color;
     item.material.unlit = unlit;
     item.material.texture = texture;
+    item.material.specular = specular;
+    item.material.shininess = shininess;
+    item.material.opacity = opacity;
     scene.items.push_back(item);
 }
 
@@ -1328,10 +1333,7 @@ void WorldAssets::build(const Grid& map) {
     floorMesh = Mesh{};
     ceilingMesh = Mesh{};
     waterMesh = Mesh{};
-    particleMesh = Mesh{};
-    particleMesh.addQuad(Vec3{-0.5, -0.5, 0.0}, Vec3{1.0, 0.0, 0.0},
-                         Vec3{0.0, 1.0, 0.0}, 1.0, 1.0, Vec2{0.0, 0.0},
-                         Vec2{1.0, 1.0});
+    particleMesh = makeDiscMesh(12, 0.0, 0.5);
 
     floorMesh.addQuad(Vec3{0.0, 0.0, 0.0}, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0},
                       static_cast<double>(kMapWidth), static_cast<double>(kMapHeight),
@@ -1407,10 +1409,10 @@ ZombieAssets::ZombieAssets() {
     rightArm.addBox(Vec3{-0.055, -0.055, -0.56}, Vec3{0.055, 0.055, 0.0});
     leftEye.addBox(Vec3{-0.006, -0.022, -0.02}, Vec3{0.012, 0.022, 0.02});
     rightEye.addBox(Vec3{-0.006, -0.022, -0.02}, Vec3{0.012, 0.022, 0.02});
-    shadow = makeDiscMesh(14);
+    shadow = makeDiscMesh(14, 0.0);
     healthQuad.addQuad(Vec3{-0.5, -0.5, 0.0}, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0},
                        1.0, 1.0, Vec2{0.0, 0.0}, Vec2{1.0, 1.0});
-    bloodPool = makeDiscMesh(18);
+    bloodPool = makeDiscMesh(18, 0.0);
 }
 
 VehicleAssets::VehicleAssets() {
@@ -1425,29 +1427,34 @@ VehicleAssets::VehicleAssets() {
     headlight.addBox(Vec3{0.80, 0.16, 0.46}, Vec3{0.865, 0.28, 0.545});
     taillight.addBox(Vec3{-0.865, -0.30, 0.46}, Vec3{-0.80, -0.20, 0.545});
     taillight.addBox(Vec3{-0.865, 0.20, 0.46}, Vec3{-0.80, 0.30, 0.545});
-    shadow = makeDiscMesh(18);
+    shadow = makeDiscMesh(18, 0.0);
 }
 
 void appendWorldGeometry(Scene& scene, const WorldAssets& assets, bool includeCeiling) {
     const Color white = makeColor(255, 255, 255);
     addPart(scene, assets.floorMesh, identityMatrix(), white, false,
-            &assets.floorTexture);
+            &assets.floorTexture, 0.12, 28.0);
     for (int material = 1; material <= 5; ++material) {
+        // Bricks and wood stay mostly matte; stone and gold catch a sheen.
+        const double specular = material == 5 ? 0.45 : (material == 2 ? 0.12 : 0.04);
+        const double shininess = material == 5 ? 48.0 : 24.0;
         addPart(scene, assets.wallMeshes[static_cast<std::size_t>(material)],
                 identityMatrix(), white, false,
-                &assets.wallTextures[static_cast<std::size_t>(material)]);
+                &assets.wallTextures[static_cast<std::size_t>(material)], specular,
+                shininess);
         if (!assets.wallTopMeshes[static_cast<std::size_t>(material)].triangles.empty()) {
             addPart(scene, assets.wallTopMeshes[static_cast<std::size_t>(material)],
                     identityMatrix(),
-                    mapMaterialColor(static_cast<std::uint8_t>(material)));
+                    mapMaterialColor(static_cast<std::uint8_t>(material)), false,
+                    nullptr, specular, shininess);
         }
     }
     if (includeCeiling) {
         addPart(scene, assets.ceilingMesh, identityMatrix(), white, false,
-                &assets.ceilingTexture);
+                &assets.ceilingTexture, 0.02, 16.0);
     }
     addPart(scene, assets.waterMesh, identityMatrix(), white, false,
-            &assets.waterTexture);
+            &assets.waterTexture, 0.9, 110.0);
 }
 
 void appendVehicles(Scene& scene, const Game& game, const VehicleAssets& assets) {
@@ -1460,10 +1467,11 @@ void appendVehicles(Scene& scene, const Game& game, const VehicleAssets& assets)
                 translationMatrix(mapToWorld(vehicle.position, 0.02)) *
                     rotationZMatrix(-vehicle.heading) *
                     scaleMatrix(Vec3{1.05, 0.62, 1.0}),
-                makeColor(12, 14, 18), true);
-        addPart(scene, assets.body, transform, paint);
-        addPart(scene, assets.cabin, transform, makeColor(44, 60, 80));
-        addPart(scene, assets.roof, transform, paint);
+                makeColor(12, 14, 18), true, nullptr, 0.0, 32.0, 0.65);
+        addPart(scene, assets.body, transform, paint, false, nullptr, 0.55, 52.0);
+        addPart(scene, assets.cabin, transform, makeColor(44, 60, 80), false,
+                nullptr, 0.8, 90.0);
+        addPart(scene, assets.roof, transform, paint, false, nullptr, 0.55, 52.0);
         addPart(scene, assets.headlight, transform, makeColor(255, 244, 186), true);
         addPart(scene, assets.taillight, transform, makeColor(214, 48, 38), true);
 
@@ -1476,8 +1484,10 @@ void appendVehicles(Scene& scene, const Game& game, const VehicleAssets& assets)
                 wheelModel = wheelModel * rotationZMatrix(-vehicle.steer);
             }
             wheelModel = wheelModel * rotationYMatrix(vehicle.wheelSpin);
-            addPart(scene, assets.wheel, wheelModel, makeColor(26, 26, 29));
-            addPart(scene, assets.hub, wheelModel, makeColor(156, 158, 164));
+            addPart(scene, assets.wheel, wheelModel, makeColor(26, 26, 29), false,
+                    nullptr, 0.10, 18.0);
+            addPart(scene, assets.hub, wheelModel, makeColor(156, 158, 164), false,
+                    nullptr, 0.6, 40.0);
         }
     }
 }
@@ -1522,11 +1532,12 @@ void appendZombies(Scene& scene, const Game& game, const ZombieAssets& assets,
                         rotationZMatrix(-zombie.heading) *
                         scaleMatrix(Vec3{0.55 + 0.35 * settle,
                                          0.40 + 0.25 * settle, 1.0}),
-                    mix(makeColor(80, 8, 8), makeColor(138, 22, 14), settle), true);
+                    mix(makeColor(80, 8, 8), makeColor(138, 22, 14), settle), true,
+                    nullptr, 0.0, 32.0, 0.9 * fade);
             addPart(scene, assets.shadow,
                     translationMatrix(mapToWorld(zombie.position, 0.018)) *
                         scaleMatrix(Vec3{0.50, 0.34, 1.0}),
-                    makeColor(12, 14, 18), true);
+                    makeColor(12, 14, 18), true, nullptr, 0.0, 32.0, 0.6);
             const double splay = zombie.flattened ? 1.35 : 0.95;
             addPart(scene, assets.leftLeg,
                     corpse * translationMatrix(Vec3{0.0, 0.10, 0.78}) *
@@ -1564,7 +1575,7 @@ void appendZombies(Scene& scene, const Game& game, const ZombieAssets& assets,
         addPart(scene, assets.shadow,
                 translationMatrix(mapToWorld(zombie.position, 0.02)) *
                     scaleMatrix(Vec3{0.36, 0.36, 1.0}),
-                makeColor(12, 14, 18), true);
+                makeColor(12, 14, 18), true, nullptr, 0.0, 32.0, 0.6);
         addPart(scene, assets.leftLeg,
                 base * translationMatrix(Vec3{0.0, 0.10, 0.78}) *
                     rotationYMatrix(swing),
@@ -1644,7 +1655,7 @@ void appendParticles(Scene& scene, const Game& game, const WorldAssets& assets) 
         addPart(scene, assets.particleMesh,
                 translationMatrix(mapToWorld(particle.position, particle.height)) *
                     billboard * scaleMatrix(Vec3{size, size, 1.0}),
-                shade(particle.color, 0.45 + 0.55 * fade), true);
+                particle.color, true, nullptr, 0.0, 32.0, fade);
     }
 }
 
