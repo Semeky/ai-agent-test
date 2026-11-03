@@ -21,8 +21,14 @@ jobs:
       - name: Run built-in tests
         run: make test
 
-      - name: Render a frame and convert it
+      - name: Render frames and convert them
         run: |
-          ./raycasting --render /tmp/frame.ppm --width 320 --height 180 --minimap
-          python3 tools/ppm_to_png.py /tmp/frame.ppm /tmp/frame.png
-          test -s /tmp/frame.png
+          ./game3d --render /tmp/first-person.ppm --width 320 --height 180 --minimap
+          ./game3d --render /tmp/overhead.ppm --width 320 --height 180 --map
+          ./game3d --render /tmp/driving.ppm --width 320 --height 180 --drive 0
+          python3 tools/ppm_to_png.py /tmp/first-person.ppm /tmp/first-person.png
+          python3 tools/ppm_to_png.py /tmp/overhead.ppm /tmp/overhead.png
+          python3 tools/ppm_to_png.py /tmp/driving.ppm /tmp/driving.png
+          test -s /tmp/first-person.png
+          test -s /tmp/overhead.png
+          test -s /tmp/driving.png

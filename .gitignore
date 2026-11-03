@@ -1,4 +1,4 @@
-/raycasting
+/game3d
 *.o
 *.ppm
 __pycache__/
