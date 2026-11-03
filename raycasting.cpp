@@ -9,7 +9,9 @@
 //   * every wall slice samples a procedural 64x64 texture, then gets distance
 //     fog and side shading;
 //   * a top-down view draws the map and the actual ray fan, so the algorithm
-//     can be inspected directly.
+//     can be inspected directly;
+//   * depth-tested zombie billboards with health bars add a small combat layer
+//     on top of the renderer.
 //
 // Run `raycasting` in a truecolor terminal for the interactive demo, or use
 // `--render frame.ppm` to write a single frame.  `--selftest` checks the ray
@@ -278,6 +280,196 @@ RayHit castRay(const Grid& map, Vec2 origin, Vec2 direction) {
 }
 
 // ---------------------------------------------------------------------------
+// Zombies and combat
+// ---------------------------------------------------------------------------
+
+constexpr int kPlayerMaxHealth = 100;
+constexpr int kZombieMaxHealth = 100;
+constexpr double kZombieRadius = 0.3;
+constexpr double kZombieHeight = 0.9;  // feet to the top of the head, world units
+constexpr double kZombieWidth = 0.45;  // matches the 32x64 sprite aspect ratio
+constexpr double kZombieAggroRange = 9.0;
+constexpr double kZombieAttackRange = 0.95;
+constexpr double kZombieSpeed = 0.85;
+constexpr int kZombieAttackDamage = 10;
+constexpr double kZombieAttackCooldown = 1.1;
+constexpr double kZombieRespawnSeconds = 8.0;
+constexpr int kShotDamage = 34;
+constexpr double kShotCooldown = 0.24;
+
+struct Zombie {
+    Vec2 spawn;
+    Vec2 position;
+    int health = kZombieMaxHealth;
+    int maxHealth = kZombieMaxHealth;
+    bool alive = true;
+    double respawnTimer = 0.0;
+    double attackTimer = 0.0;
+    double hitFlash = 0.0;
+    double walkPhase = 0.0;
+};
+
+// Fixed spawns keep both screenshots and the interactive demo reproducible.
+// The first three stand in the starting view, the remaining three spread out
+// through the atrium and the outer hall.
+constexpr std::array<Vec2, 6> kZombieSpawns{{
+    {8.5, 13.5}, {10.5, 9.5}, {14.5, 14.5},
+    {7.5, 8.5},  {16.5, 15.5}, {2.5, 6.5},
+}};
+// Starting health is varied on purpose so the screenshot shows all three
+// health-bar colours without having to fire a shot first.
+constexpr std::array<int, 6> kZombieStartHealth{{100, 55, 30, 100, 80, 100}};
+
+std::vector<Zombie> createZombies() {
+    std::vector<Zombie> zombies;
+    zombies.reserve(kZombieSpawns.size());
+    for (std::size_t i = 0; i < kZombieSpawns.size(); ++i) {
+        Zombie zombie;
+        zombie.spawn = kZombieSpawns[i];
+        zombie.position = zombie.spawn;
+        zombie.maxHealth = kZombieMaxHealth;
+        zombie.health = kZombieStartHealth[i];
+        zombie.attackTimer = 0.6;
+        zombies.push_back(zombie);
+    }
+    return zombies;
+}
+
+bool hasLineOfSight(const Grid& map, Vec2 from, Vec2 to) {
+    const Vec2 delta{to.x - from.x, to.y - from.y};
+    const double distance = std::hypot(delta.x, delta.y);
+    if (distance < 1e-9) {
+        return true;
+    }
+    const Vec2 direction{delta.x / distance, delta.y / distance};
+    const RayHit hit = castRay(map, from, direction);
+    return hit.material == 0 || hit.distance >= distance - 1e-6;
+}
+
+void tryMove(const Grid& map, Vec2& position, Vec2 delta) {
+    if (isWalkableCentered(map, Vec2{position.x + delta.x, position.y})) {
+        position.x += delta.x;
+    }
+    if (isWalkableCentered(map, Vec2{position.x, position.y + delta.y})) {
+        position.y += delta.y;
+    }
+}
+
+// Hitscan along the view direction: the closest living zombie whose body
+// intersects the ray, unless a wall is closer.
+int findShotTarget(const std::vector<Zombie>& zombies, const Grid& map, Vec2 origin,
+                   Vec2 direction) {
+    const double length = std::hypot(direction.x, direction.y);
+    if (length < 1e-9) {
+        return -1;
+    }
+    const Vec2 ray{direction.x / length, direction.y / length};
+    const RayHit wall = castRay(map, origin, ray);
+    int best = -1;
+    double bestDistance = wall.material == 0 ? 1e30 : wall.distance;
+    for (std::size_t i = 0; i < zombies.size(); ++i) {
+        const Zombie& zombie = zombies[i];
+        if (!zombie.alive) {
+            continue;
+        }
+        const Vec2 relative{zombie.position.x - origin.x, zombie.position.y - origin.y};
+        const double along = relative.x * ray.x + relative.y * ray.y;
+        if (along <= 0.0 || along >= bestDistance) {
+            continue;
+        }
+        const double perpendicular = std::fabs(relative.x * ray.y - relative.y * ray.x);
+        if (perpendicular > kZombieRadius) {
+            continue;
+        }
+        best = static_cast<int>(i);
+        bestDistance = along;
+    }
+    return best;
+}
+
+// Returns true when this hit killed the zombie.
+bool damageZombie(Zombie& zombie, int damage) {
+    if (!zombie.alive) {
+        return false;
+    }
+    zombie.health = std::max(0, zombie.health - damage);
+    zombie.hitFlash = 0.16;
+    if (zombie.health == 0) {
+        zombie.alive = false;
+        zombie.respawnTimer = kZombieRespawnSeconds;
+        zombie.attackTimer = 0.0;
+        return true;
+    }
+    return false;
+}
+
+// Moves zombies toward the player, handles melee attacks and respawns.  The
+// return value is the damage the player should take this frame.
+int updateZombies(std::vector<Zombie>& zombies, const Grid& map, Vec2 playerPosition,
+                  double deltaSeconds, bool playerAlive) {
+    int playerDamage = 0;
+    for (Zombie& zombie : zombies) {
+        zombie.hitFlash = std::max(0.0, zombie.hitFlash - deltaSeconds);
+        if (!zombie.alive) {
+            zombie.respawnTimer -= deltaSeconds;
+            if (zombie.respawnTimer <= 0.0) {
+                const double dx = zombie.spawn.x - playerPosition.x;
+                const double dy = zombie.spawn.y - playerPosition.y;
+                if (std::hypot(dx, dy) > 2.5 && isWalkableCentered(map, zombie.spawn, 0.25)) {
+                    zombie.position = zombie.spawn;
+                    zombie.health = zombie.maxHealth;
+                    zombie.alive = true;
+                    zombie.attackTimer = 0.5;
+                    zombie.walkPhase = 0.0;
+                }
+            }
+            continue;
+        }
+
+        zombie.attackTimer = std::max(0.0, zombie.attackTimer - deltaSeconds);
+        const Vec2 relative{playerPosition.x - zombie.position.x,
+                            playerPosition.y - zombie.position.y};
+        const double distance = std::hypot(relative.x, relative.y);
+        if (distance > 1e-9 && distance < kZombieAggroRange &&
+            hasLineOfSight(map, zombie.position, playerPosition)) {
+            if (distance > kZombieAttackRange) {
+                const double step =
+                    std::min(kZombieSpeed * deltaSeconds, distance - kZombieAttackRange);
+                tryMove(map, zombie.position,
+                        Vec2{relative.x / distance * step, relative.y / distance * step});
+                zombie.walkPhase += deltaSeconds * 7.0;
+            } else if (playerAlive && zombie.attackTimer <= 0.0) {
+                playerDamage += kZombieAttackDamage;
+                zombie.attackTimer = kZombieAttackCooldown;
+            }
+        }
+    }
+
+    // Keep the undead from stacking into a single billboard.
+    for (std::size_t i = 0; i < zombies.size(); ++i) {
+        if (!zombies[i].alive) {
+            continue;
+        }
+        for (std::size_t j = i + 1; j < zombies.size(); ++j) {
+            if (!zombies[j].alive) {
+                continue;
+            }
+            const double dx = zombies[j].position.x - zombies[i].position.x;
+            const double dy = zombies[j].position.y - zombies[i].position.y;
+            const double distance = std::hypot(dx, dy);
+            if (distance < 1e-6 || distance >= 0.55) {
+                continue;
+            }
+            const double push = (0.55 - distance) * 0.5;
+            const Vec2 normal{dx / distance, dy / distance};
+            tryMove(map, zombies[i].position, Vec2{-normal.x * push, -normal.y * push});
+            tryMove(map, zombies[j].position, Vec2{normal.x * push, normal.y * push});
+        }
+    }
+    return playerDamage;
+}
+
+// ---------------------------------------------------------------------------
 // Procedural wall textures (64x64, tiling)
 // ---------------------------------------------------------------------------
 
@@ -455,6 +647,187 @@ class Image {
     std::vector<Color> pixels_;
 };
 
+// ---------------------------------------------------------------------------
+// Procedural zombie sprite: hand-drawn 32x64 pixel art, generated once
+// ---------------------------------------------------------------------------
+
+constexpr int kZombieSpriteWidth = 32;
+constexpr int kZombieSpriteHeight = 64;
+
+struct SpriteFrame {
+    std::array<Color, kZombieSpriteWidth * kZombieSpriteHeight> pixels{};
+    std::array<std::uint8_t, kZombieSpriteWidth * kZombieSpriteHeight> alpha{};
+};
+
+SpriteFrame makeZombieSprite(int variant) {
+    SpriteFrame sprite;
+    const auto indexOf = [](int x, int y) {
+        return static_cast<std::size_t>(y) * kZombieSpriteWidth +
+               static_cast<std::size_t>(x);
+    };
+    const auto put = [&](int x, int y, Color color) {
+        if (x < 0 || y < 0 || x >= kZombieSpriteWidth || y >= kZombieSpriteHeight) {
+            return;
+        }
+        const std::size_t index = indexOf(x, y);
+        sprite.pixels[index] = color;
+        sprite.alpha[index] = 255;
+    };
+    const auto rect = [&](int x, int y, int width, int height, Color color) {
+        for (int py = y; py < y + height; ++py) {
+            for (int px = x; px < x + width; ++px) {
+                put(px, py, color);
+            }
+        }
+    };
+    const auto ellipse = [&](int centerX, int centerY, int radiusX, int radiusY, Color color) {
+        for (int py = -radiusY; py <= radiusY; ++py) {
+            for (int px = -radiusX; px <= radiusX; ++px) {
+                const double nx = static_cast<double>(px) / radiusX;
+                const double ny = static_cast<double>(py) / radiusY;
+                if (nx * nx + ny * ny <= 1.0) {
+                    put(centerX + px, centerY + py, color);
+                }
+            }
+        }
+    };
+
+    const Color skin = makeColor(94, 132, 76);
+    const Color skinLight = makeColor(128, 164, 100);
+    const Color skinDark = makeColor(58, 88, 50);
+    const Color shirt = makeColor(72, 80, 66);
+    const Color shirtDark = makeColor(48, 55, 45);
+    const Color pants = makeColor(47, 55, 70);
+    const Color pantsDark = makeColor(30, 36, 48);
+    const Color shoe = makeColor(28, 25, 22);
+    const Color hair = makeColor(34, 42, 30);
+    const Color blood = makeColor(112, 26, 26);
+    const Color eye = makeColor(238, 66, 46);
+    const Color socket = makeColor(24, 24, 20);
+    const Color bone = makeColor(214, 204, 164);
+
+    // Legs first, with a simple two-frame walk cycle.
+    if (variant == 0) {
+        rect(10, 45, 5, 15, pants);
+        rect(9, 60, 7, 3, shoe);
+        rect(17, 45, 5, 15, pants);
+        rect(16, 60, 7, 3, shoe);
+    } else {
+        rect(9, 45, 5, 14, pants);
+        rect(8, 59, 7, 3, shoe);
+        rect(18, 45, 5, 16, pants);
+        rect(17, 61, 7, 3, shoe);
+    }
+    put(11, 52, pantsDark);
+    put(12, 52, pantsDark);
+    put(19, 50, pantsDark);
+
+    // Outstretched arms: ragged sleeve, bare forearm and a blocky hand.
+    rect(2, 27, 6, 5, skin);
+    rect(0, 28, 3, 4, skinLight);
+    rect(7, 26, 3, 7, shirtDark);
+    put(0, 29, skin);
+    put(0, 31, skin);
+    rect(24, 27, 6, 5, skin);
+    rect(29, 28, 3, 4, skinLight);
+    rect(22, 26, 3, 7, shirtDark);
+
+    // Torso and torn shirt.
+    rect(8, 24, 16, 3, shirt);
+    rect(9, 27, 14, 17, shirt);
+    rect(9, 44, 14, 2, shirtDark);
+    rect(14, 22, 4, 3, skinDark);  // neck
+    rect(14, 24, 4, 2, skin);      // open collar
+    put(16, 29, shirtDark);
+    put(16, 33, shirtDark);
+    put(16, 37, shirtDark);
+    put(16, 41, shirtDark);
+    rect(11, 34, 2, 3, skin);      // tear
+    rect(10, 34, 1, 3, shirtDark);
+    rect(19, 38, 2, 2, skin);      // tear
+    rect(14, 35, 3, 4, blood);
+    put(13, 36, blood);
+    put(18, 34, blood);
+    put(20, 30, blood);
+    rect(19, 28, 3, 3, makeColor(60, 66, 54));
+    rect(15, 44, 2, 2, makeColor(120, 100, 60));
+
+    // Head, hair and a damaged, hungry face.
+    ellipse(16, 16, 8, 9, skin);
+    rect(7, 15, 2, 3, skinDark);
+    rect(23, 15, 2, 3, skinDark);
+    ellipse(16, 10, 8, 4, hair);
+    put(11, 13, hair);
+    put(13, 12, hair);
+    put(15, 13, hair);
+    put(18, 12, hair);
+    put(21, 13, hair);
+    rect(10, 14, 4, 1, hair);
+    rect(18, 14, 4, 1, hair);
+    rect(10, 15, 4, 3, socket);
+    rect(18, 15, 4, 3, socket);
+    rect(11, 16, 2, 2, eye);
+    rect(19, 16, 2, 2, eye);
+    put(11, 16, makeColor(255, 196, 150));
+    put(13, 9, skin);              // bare patch in the hair
+    put(14, 9, blood);
+    put(21, 12, skinDark);         // scar
+    put(22, 13, skinDark);
+    put(22, 14, skinDark);
+    rect(15, 18, 2, 2, skinDark);  // nose
+    rect(13, 21, 6, 2, makeColor(28, 18, 18));
+    put(14, 21, bone);
+    put(16, 21, bone);
+    put(18, 21, bone);
+    put(13, 23, skinDark);
+
+    // Side shading before the silhouette outline gives the flat art some depth.
+    for (int y = 0; y < kZombieSpriteHeight; ++y) {
+        for (int x = 0; x < kZombieSpriteWidth; ++x) {
+            const std::size_t index = indexOf(x, y);
+            if (sprite.alpha[index] == 0) {
+                continue;
+            }
+            const bool leftEdge = x == 0 || sprite.alpha[indexOf(x - 1, y)] == 0;
+            const bool rightEdge =
+                x == kZombieSpriteWidth - 1 || sprite.alpha[indexOf(x + 1, y)] == 0;
+            if (rightEdge) {
+                sprite.pixels[index] = shade(sprite.pixels[index], 0.72);
+            } else if (leftEdge) {
+                sprite.pixels[index] = mix(sprite.pixels[index], makeColor(255, 255, 255), 0.1);
+            }
+        }
+    }
+
+    // A one-pixel dark outline keeps the sprite readable against the floor.
+    std::array<std::uint8_t, kZombieSpriteWidth * kZombieSpriteHeight> silhouette =
+        sprite.alpha;
+    for (int y = 0; y < kZombieSpriteHeight; ++y) {
+        for (int x = 0; x < kZombieSpriteWidth; ++x) {
+            const std::size_t index = indexOf(x, y);
+            if (silhouette[index] != 0) {
+                continue;
+            }
+            const bool nextToBody =
+                (x > 0 && silhouette[indexOf(x - 1, y)] != 0) ||
+                (x + 1 < kZombieSpriteWidth && silhouette[indexOf(x + 1, y)] != 0) ||
+                (y > 0 && silhouette[indexOf(x, y - 1)] != 0) ||
+                (y + 1 < kZombieSpriteHeight && silhouette[indexOf(x, y + 1)] != 0);
+            if (nextToBody) {
+                sprite.pixels[index] = makeColor(9, 12, 9);
+                sprite.alpha[index] = 255;
+            }
+        }
+    }
+    return sprite;
+}
+
+const SpriteFrame& zombieSprite(int walkPhase) {
+    static const std::array<SpriteFrame, 2> frames{{makeZombieSprite(0), makeZombieSprite(1)}};
+    const int frame = ((walkPhase % 2) + 2) % 2;
+    return frames[static_cast<std::size_t>(frame)];
+}
+
 const Color kFogColor = makeColor(10, 13, 19);
 
 Color floorTexture(Vec2 world) {
@@ -539,12 +912,222 @@ void renderFloorAndCeiling(Image& image, Vec2 position, double yawDegrees,
 }
 
 // ---------------------------------------------------------------------------
+// Zombie billboards and health bars
+// ---------------------------------------------------------------------------
+
+struct ZombieProjection {
+    bool onScreen = false;
+    double depth = 0.0;      // perpendicular distance from the camera plane
+    double centerX = 0.0;    // screen x of the billboard centre
+    double unit = 0.0;       // screen pixels per world unit at this depth
+    double left = 0.0;
+    double right = 0.0;
+    double top = 0.0;
+    double bottom = 0.0;
+};
+
+ZombieProjection projectZombie(Vec2 position, Vec2 player, double yawDegrees,
+                               double fovDegrees, int width, int height) {
+    ZombieProjection projection;
+    const Vec2 direction = directionFromDegrees(yawDegrees);
+    const double halfPlane = std::tan(fovDegrees * 0.5 * kDegToRad);
+    const Vec2 plane{-direction.y * halfPlane, direction.x * halfPlane};
+    const double projectionScale = width / (2.0 * halfPlane);
+    const double horizon = height * 0.5;
+    const Vec2 relative{position.x - player.x, position.y - player.y};
+
+    // Inverse of the camera matrix, so a world position becomes camera space.
+    const double determinant = plane.x * direction.y - direction.x * plane.y;
+    if (std::fabs(determinant) < 1e-12) {
+        return projection;
+    }
+    const double inverse = 1.0 / determinant;
+    const double cameraX = inverse * (direction.y * relative.x - direction.x * relative.y);
+    const double cameraDepth = inverse * (-plane.y * relative.x + plane.x * relative.y);
+    projection.depth = cameraDepth;
+    if (cameraDepth <= 0.05) {
+        return projection;
+    }
+
+    projection.unit = projectionScale / cameraDepth;
+    projection.centerX = width * 0.5 * (1.0 + cameraX / cameraDepth);
+    projection.left = projection.centerX - 0.5 * kZombieWidth * projection.unit;
+    projection.right = projection.centerX + 0.5 * kZombieWidth * projection.unit;
+    projection.top = horizon - (kZombieHeight - kEyeHeight) * projection.unit;
+    projection.bottom = horizon + kEyeHeight * projection.unit;
+    projection.onScreen = projection.right > 0.0 && projection.left < width &&
+                          projection.bottom > 0.0 && projection.top < height;
+    return projection;
+}
+
+Color healthBarColor(double fraction) {
+    if (fraction > 0.66) {
+        return makeColor(92, 214, 96);
+    }
+    if (fraction > 0.33) {
+        return makeColor(233, 186, 62);
+    }
+    return makeColor(226, 72, 58);
+}
+
+void drawHealthBar(Image& image, int x, int y, int width, int height, double fraction) {
+    if (width <= 1 || height <= 0) {
+        return;
+    }
+    const double clamped = std::clamp(fraction, 0.0, 1.0);
+    image.fillRect(x - 1, y - 1, width + 2, height + 2, makeColor(7, 9, 11), 0.95);
+    image.fillRect(x, y, width, height, makeColor(52, 20, 20));
+    const int fillWidth =
+        static_cast<int>(std::lround((width - 2) * clamped));
+    if (fillWidth > 0) {
+        const Color fill = healthBarColor(clamped);
+        image.fillRect(x + 1, y + 1, fillWidth, height - 2, fill);
+        image.fillRect(x + 1, y + 1, fillWidth, 1,
+                       mix(fill, makeColor(255, 255, 255), 0.35), 0.7);
+    }
+}
+
+void renderZombies(Image& image, const std::vector<Zombie>& zombies, Vec2 position,
+                   double yawDegrees, double fovDegrees,
+                   const std::vector<double>& wallDepth) {
+    struct OrderedZombie {
+        ZombieProjection projection;
+        std::size_t index = 0;
+    };
+    std::vector<OrderedZombie> ordered;
+    ordered.reserve(zombies.size());
+    for (std::size_t i = 0; i < zombies.size(); ++i) {
+        if (!zombies[i].alive) {
+            continue;
+        }
+        const ZombieProjection projection =
+            projectZombie(zombies[i].position, position, yawDegrees, fovDegrees,
+                          image.width(), image.height());
+        if (projection.depth > 0.05 && projection.onScreen) {
+            ordered.push_back(OrderedZombie{projection, i});
+        }
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const OrderedZombie& a, const OrderedZombie& b) {
+                  return a.projection.depth > b.projection.depth;
+              });
+
+    for (const OrderedZombie& entry : ordered) {
+        const Zombie& zombie = zombies[entry.index];
+        const ZombieProjection& p = entry.projection;
+        const SpriteFrame& sprite = zombieSprite(static_cast<int>(zombie.walkPhase));
+        const int firstX =
+            std::max(0, static_cast<int>(std::ceil(p.left)));
+        const int lastX =
+            std::min(image.width() - 1, static_cast<int>(std::floor(p.right)));
+        const int firstY =
+            std::max(0, static_cast<int>(std::ceil(p.top)));
+        const int lastY =
+            std::min(image.height() - 1, static_cast<int>(std::floor(p.bottom)));
+        if (firstX > lastX || firstY > lastY) {
+            continue;
+        }
+
+        const double widthSpan = std::max(p.right - p.left, 1e-9);
+        const double heightSpan = std::max(p.bottom - p.top, 1e-9);
+        double fog = 1.0 - 1.0 / (1.0 + 0.014 * p.depth * p.depth);
+        fog = std::min(fog, 0.84);
+        const bool flashing = zombie.hitFlash > 0.0;
+
+        for (int x = firstX; x <= lastX; ++x) {
+            if (p.depth >= wallDepth[static_cast<std::size_t>(x)]) {
+                continue;
+            }
+            const double u = (x + 0.5 - p.left) / widthSpan;
+            const int textureX =
+                std::clamp(static_cast<int>(u * kZombieSpriteWidth), 0,
+                           kZombieSpriteWidth - 1);
+            for (int y = firstY; y <= lastY; ++y) {
+                const double v = (y + 0.5 - p.top) / heightSpan;
+                const int textureY =
+                    std::clamp(static_cast<int>(v * kZombieSpriteHeight), 0,
+                               kZombieSpriteHeight - 1);
+                const std::size_t index =
+                    static_cast<std::size_t>(textureY) * kZombieSpriteWidth +
+                    static_cast<std::size_t>(textureX);
+                if (sprite.alpha[index] == 0) {
+                    continue;
+                }
+                Color color = sprite.pixels[index];
+                if (flashing) {
+                    color = mix(color, makeColor(255, 188, 168), 0.55);
+                }
+                color = mix(color, kFogColor, fog);
+                image.at(x, y) = color;
+            }
+        }
+
+        const int centerColumn =
+            std::clamp(static_cast<int>(std::lround(p.centerX)), 0, image.width() - 1);
+        if (p.depth >= wallDepth[static_cast<std::size_t>(centerColumn)]) {
+            continue;
+        }
+        const int barWidth =
+            std::clamp(static_cast<int>(std::lround(p.unit * kZombieWidth * 0.85)), 14, 160);
+        const int barHeight = std::clamp(barWidth / 9, 2, 9);
+        const int barGap = std::max(2, barWidth / 24);
+        const int barX =
+            static_cast<int>(std::lround(p.centerX - barWidth * 0.5));
+        const int barY = std::max(1, static_cast<int>(std::lround(p.top - barHeight - barGap)));
+        if (barY >= image.height()) {
+            continue;
+        }
+        const auto isBarVisible = [&](int screenX) {
+            const int column = std::clamp(screenX, 0, image.width() - 1);
+            return p.depth < wallDepth[static_cast<std::size_t>(column)];
+        };
+        if (!isBarVisible(barX) || !isBarVisible(barX + barWidth - 1)) {
+            continue;
+        }
+        drawHealthBar(image, barX, barY, barWidth, barHeight,
+                      static_cast<double>(zombie.health) /
+                          static_cast<double>(std::max(1, zombie.maxHealth)));
+    }
+}
+
+void renderCrosshair(Image& image, bool firing) {
+    const int centerX = image.width() / 2;
+    const int centerY = image.height() / 2;
+    const Color color = firing ? makeColor(255, 225, 120) : makeColor(232, 236, 240);
+    for (int offset = 3; offset <= 7; ++offset) {
+        image.blend(centerX + offset, centerY, color, 0.8);
+        image.blend(centerX - offset, centerY, color, 0.8);
+        image.blend(centerX, centerY + offset, color, 0.8);
+        image.blend(centerX, centerY - offset, color, 0.8);
+    }
+    image.blend(centerX, centerY, color, 0.95);
+}
+
+void renderPlayerHud(Image& image, int health) {
+    const int barWidth = std::clamp(image.width() / 4, 100, 260);
+    const int barHeight = std::clamp(barWidth / 16, 6, 12);
+    const int x = 12;
+    const int y = image.height() - barHeight - 14;
+    const int iconSize = barHeight + 4;
+    image.fillRect(x - 8, y - 9, barWidth + iconSize + 30, barHeight + 18,
+                   makeColor(5, 7, 10), 0.55);
+    // Small medical-cross icon in front of the player health bar.
+    image.fillRect(x, y - 2, iconSize, iconSize, makeColor(126, 32, 30));
+    image.fillRect(x + iconSize / 2 - 1, y, 2, iconSize - 4, makeColor(240, 236, 230));
+    image.fillRect(x + 2, y + iconSize / 2 - 3, iconSize - 4, 2,
+                   makeColor(240, 236, 230));
+    drawHealthBar(image, x + iconSize + 8, y, barWidth, barHeight,
+                  static_cast<double>(health) / static_cast<double>(kPlayerMaxHealth));
+}
+
+// ---------------------------------------------------------------------------
 // 3D renderer
 // ---------------------------------------------------------------------------
 
 void render3D(Image& image, const Grid& map, Vec2 position, double yawDegrees,
-              double fovDegrees) {
+              double fovDegrees, const std::vector<Zombie>& zombies) {
     renderFloorAndCeiling(image, position, yawDegrees, fovDegrees);
+    std::vector<double> wallDepth(static_cast<std::size_t>(image.width()), 1e30);
 
     const Vec2 direction = directionFromDegrees(yawDegrees);
     const double halfPlane = std::tan(fovDegrees * 0.5 * kDegToRad);
@@ -597,7 +1180,10 @@ void render3D(Image& image, const Grid& map, Vec2 position, double yawDegrees,
             color = mix(color, kFogColor, fog);
             image.at(x, y) = color;
         }
+        wallDepth[static_cast<std::size_t>(x)] = hit.distance;
     }
+
+    renderZombies(image, zombies, position, yawDegrees, fovDegrees, wallDepth);
 }
 
 // ---------------------------------------------------------------------------
@@ -696,8 +1282,33 @@ void paintPlayer(Image& image, Vec2 position, double yawDegrees, int offsetX, in
                    makeColor(255, 238, 190), 0.95);
 }
 
+void paintZombies(Image& image, const std::vector<Zombie>& zombies, int offsetX,
+                  int offsetY, int scale, bool detailed) {
+    for (const Zombie& zombie : zombies) {
+        if (!zombie.alive) {
+            continue;
+        }
+        const int centerX =
+            static_cast<int>(std::lround(offsetX + zombie.position.x * scale));
+        const int centerY =
+            static_cast<int>(std::lround(offsetY + zombie.position.y * scale));
+        const int radius = std::max(detailed ? 2 : 1, scale / 3);
+        image.drawCircle(centerX, centerY, radius + 1, makeColor(10, 12, 12), 0.9);
+        image.drawCircle(centerX, centerY, radius, makeColor(210, 72, 56), 1.0);
+        image.blend(centerX, centerY, makeColor(255, 190, 90), 0.85);
+        if (detailed) {
+            const int barWidth = std::max(8, scale);
+            const int barHeight = std::max(2, scale / 8);
+            drawHealthBar(image, centerX - barWidth / 2,
+                          centerY - radius - barHeight - 3, barWidth, barHeight,
+                          static_cast<double>(zombie.health) /
+                              static_cast<double>(std::max(1, zombie.maxHealth)));
+        }
+    }
+}
+
 void renderMinimap(Image& image, const Grid& map, Vec2 position, double yawDegrees,
-                   double fovDegrees) {
+                   double fovDegrees, const std::vector<Zombie>& zombies) {
     const int scale = std::clamp(std::min(image.width(), image.height()) / 70, 2, 10);
     const int offsetX = 12;
     const int offsetY = 12;
@@ -716,11 +1327,12 @@ void renderMinimap(Image& image, const Grid& map, Vec2 position, double yawDegre
     paintMapCells(image, map, offsetX, offsetY, scale, false);
     paintRayFan(image, map, position, yawDegrees, fovDegrees, offsetX, offsetY, scale,
                 std::max(24, 3 * kMapWidth), true);
+    paintZombies(image, zombies, offsetX, offsetY, scale, false);
     paintPlayer(image, position, yawDegrees, offsetX, offsetY, scale);
 }
 
 void renderMapView(Image& image, const Grid& map, Vec2 position, double yawDegrees,
-                   double fovDegrees) {
+                   double fovDegrees, const std::vector<Zombie>& zombies) {
     image.fill(makeColor(8, 10, 14));
 
     const int margin = std::max(8, std::min(image.width(), image.height()) / 24);
@@ -739,7 +1351,22 @@ void renderMapView(Image& image, const Grid& map, Vec2 position, double yawDegre
     paintMapCells(image, map, offsetX, offsetY, scale, true);
     paintRayFan(image, map, position, yawDegrees, fovDegrees, offsetX, offsetY, scale,
                 std::max(64, image.width() / 6), true);
+    paintZombies(image, zombies, offsetX, offsetY, scale, true);
     paintPlayer(image, position, yawDegrees, offsetX, offsetY, scale);
+}
+
+void renderWorld(Image& image, const Grid& map, Vec2 position, double yawDegrees,
+                 double fovDegrees, const std::vector<Zombie>& zombies, bool mapView,
+                 bool minimap, bool firing) {
+    if (mapView) {
+        renderMapView(image, map, position, yawDegrees, fovDegrees, zombies);
+    } else {
+        render3D(image, map, position, yawDegrees, fovDegrees, zombies);
+        if (minimap) {
+            renderMinimap(image, map, position, yawDegrees, fovDegrees, zombies);
+        }
+        renderCrosshair(image, firing);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -806,8 +1433,9 @@ void printUsage(std::FILE* stream) {
                  "\n"
                  "Interactive controls:\n"
                  "  W/S or Up/Down  move forward/back    A/D  strafe\n"
-                 "  Left/Right      turn                 Tab  top-down ray view\n"
-                 "  M               minimap              Q/Esc  quit\n");
+                 "  Left/Right      turn                 Space  fire\n"
+                 "  Tab             top-down ray view    M    minimap\n"
+                 "  R               restart              Q/Esc  quit\n");
 }
 
 bool parseInt(const char* text, int& value) {
@@ -1133,6 +1761,155 @@ bool selftestPPM(std::string& error) {
     return true;
 }
 
+bool selftestZombies(const Grid& map, std::string& error) {
+    const std::vector<Zombie> zombies = createZombies();
+    if (zombies.size() < 3) {
+        error = "expected at least three zombies";
+        return false;
+    }
+    for (std::size_t i = 0; i < zombies.size(); ++i) {
+        const Zombie& zombie = zombies[i];
+        if (!isWalkableCentered(map, zombie.spawn, 0.25)) {
+            error = "zombie " + std::to_string(i) + " spawns inside a wall";
+            return false;
+        }
+        if (!zombie.alive || zombie.health <= 0 || zombie.health > zombie.maxHealth) {
+            error = "zombie " + std::to_string(i) + " has invalid initial health";
+            return false;
+        }
+    }
+
+    int onScreen = 0;
+    for (const Zombie& zombie : zombies) {
+        const ZombieProjection projection =
+            projectZombie(zombie.position, kSpawn, kSpawnYaw, kDefaultFov, 960, 540);
+        if (projection.onScreen) {
+            ++onScreen;
+        }
+    }
+    if (onScreen < 2) {
+        error = "fewer than two zombies are visible from the default view";
+        return false;
+    }
+
+    // A visible zombie can be shot, loses health and dies after enough hits.
+    std::vector<Zombie> target(1);
+    target[0].spawn = target[0].position = Vec2{8.5, 13.5};
+    target[0].health = target[0].maxHealth = kZombieMaxHealth;
+    const Vec2 toTarget{target[0].position.x - kSpawn.x, target[0].position.y - kSpawn.y};
+    if (findShotTarget(target, map, kSpawn, toTarget) != 0) {
+        error = "a zombie straight ahead cannot be shot";
+        return false;
+    }
+    if (damageZombie(target[0], kShotDamage)) {
+        error = "one shot killed a full-health zombie";
+        return false;
+    }
+    damageZombie(target[0], kShotDamage);
+    if (!damageZombie(target[0], kShotDamage)) {
+        error = "three shots did not kill a full-health zombie";
+        return false;
+    }
+    if (target[0].alive || target[0].health != 0) {
+        error = "a killed zombie is still alive";
+        return false;
+    }
+    if (findShotTarget(target, map, kSpawn, toTarget) != -1) {
+        error = "a dead zombie can still be shot";
+        return false;
+    }
+
+    // Walls block the hitscan.
+    std::vector<Zombie> behindWall(1);
+    behindWall[0].spawn = behindWall[0].position = Vec2{4.5, 14.5};
+    if (findShotTarget(behindWall, map, kSpawn, Vec2{-1.0, 0.0}) != -1) {
+        error = "a shot passed through a wall";
+        return false;
+    }
+
+    // A zombie closes the distance, attacks in melee and later respawns.
+    std::vector<Zombie> chaser(1);
+    chaser[0].spawn = chaser[0].position = Vec2{7.0, 13.5};
+    chaser[0].health = chaser[0].maxHealth = kZombieMaxHealth;
+    const double distanceBefore =
+        std::hypot(chaser[0].position.x - kSpawn.x, chaser[0].position.y - kSpawn.y);
+    for (int frame = 0; frame < 20; ++frame) {
+        updateZombies(chaser, map, kSpawn, 0.05, true);
+    }
+    const double distanceAfter =
+        std::hypot(chaser[0].position.x - kSpawn.x, chaser[0].position.y - kSpawn.y);
+    if (distanceAfter >= distanceBefore - 0.05) {
+        error = "a zombie does not chase the player";
+        return false;
+    }
+    chaser[0].position = Vec2{6.9, 14.3};
+    chaser[0].attackTimer = 0.0;
+    if (updateZombies(chaser, map, kSpawn, 0.01, true) != kZombieAttackDamage) {
+        error = "a zombie in melee range does not damage the player";
+        return false;
+    }
+    chaser[0].attackTimer = 0.0;
+    if (updateZombies(chaser, map, kSpawn, 0.01, false) != 0) {
+        error = "a dead player still takes melee damage";
+        return false;
+    }
+    chaser[0] = Zombie{};
+    chaser[0].spawn = chaser[0].position = Vec2{16.5, 15.5};
+    chaser[0].alive = false;
+    chaser[0].health = 0;
+    chaser[0].respawnTimer = 0.0;
+    updateZombies(chaser, map, kSpawn, 0.01, false);
+    if (!chaser[0].alive || chaser[0].health != chaser[0].maxHealth ||
+        std::fabs(chaser[0].position.x - 16.5) > 1e-9) {
+        error = "a dead zombie does not respawn";
+        return false;
+    }
+
+    const auto countChangedPixels = [](const Image& a, const Image& b) {
+        int changed = 0;
+        for (int y = 0; y < a.height(); ++y) {
+            for (int x = 0; x < a.width(); ++x) {
+                const Color left = a.at(x, y);
+                const Color right = b.at(x, y);
+                if (left.r != right.r || left.g != right.g || left.b != right.b) {
+                    ++changed;
+                }
+            }
+        }
+        return changed;
+    };
+
+    Image emptyFrame(320, 180);
+    Image zombieFrame(320, 180);
+    render3D(emptyFrame, map, kSpawn, kSpawnYaw, kDefaultFov, {});
+    render3D(zombieFrame, map, kSpawn, kSpawnYaw, kDefaultFov, zombies);
+    if (countChangedPixels(emptyFrame, zombieFrame) < 500) {
+        error = "zombies are not visible in the rendered frame";
+        return false;
+    }
+
+    // The wall z-buffer must occlude a zombie standing behind a wall.
+    Image plainFrame(320, 180);
+    Image hiddenFrame(320, 180);
+    render3D(plainFrame, map, kSpawn, 180.0, kDefaultFov, {});
+    render3D(hiddenFrame, map, kSpawn, 180.0, kDefaultFov, behindWall);
+    if (countChangedPixels(plainFrame, hiddenFrame) != 0) {
+        error = "a zombie behind a wall is still drawn";
+        return false;
+    }
+
+    Image barImage(80, 24);
+    barImage.fill(makeColor(0, 0, 0));
+    drawHealthBar(barImage, 10, 5, 60, 8, 0.5);
+    const Color filled = barImage.at(15, 7);
+    const Color depleted = barImage.at(45, 7);
+    if (filled.g < 150 || depleted.r < 40 || depleted.g > 40) {
+        error = "health bar colours do not match the health fraction";
+        return false;
+    }
+    return true;
+}
+
 bool runSelftest(const Grid& map) {
     std::string error;
     int failures = 0;
@@ -1149,6 +1926,13 @@ bool runSelftest(const Grid& map) {
         std::printf("  [ok] axis-aligned rays handle infinite delta distances\n");
     } else {
         std::printf("  [FAIL] ray casting: %s\n", error.c_str());
+        ++failures;
+    }
+    if (selftestZombies(map, error)) {
+        std::printf("  [ok] zombies: spawns walkable, shots hit, walls occlude sprites\n");
+        std::printf("  [ok] health bars: colours follow the health fraction\n");
+    } else {
+        std::printf("  [FAIL] zombies: %s\n", error.c_str());
         ++failures;
     }
     if (selftestPPM(error)) {
@@ -1333,15 +2117,6 @@ std::string renderTerminalFrame(const Image& image) {
     return output;
 }
 
-void tryMove(const Grid& map, Vec2& position, Vec2 delta) {
-    if (isWalkableCentered(map, Vec2{position.x + delta.x, position.y})) {
-        position.x += delta.x;
-    }
-    if (isWalkableCentered(map, Vec2{position.x, position.y + delta.y})) {
-        position.y += delta.y;
-    }
-}
-
 int runInteractive(const Grid& map, Options options) {
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
         std::fprintf(stderr,
@@ -1364,11 +2139,36 @@ int runInteractive(const Grid& map, Options options) {
     bool minimap = options.minimap;
     bool running = true;
 
+    std::vector<Zombie> zombies = createZombies();
+    int playerHealth = kPlayerMaxHealth;
+    int kills = 0;
+    bool playerDead = false;
+    bool shootRequested = false;
+    double shotCooldown = 0.0;
+    double muzzleFlash = 0.0;
+    double damageFlash = 0.0;
+
     double forwardIntent = 0.0;
     double strafeIntent = 0.0;
     double turnIntent = 0.0;
     double displayedFps = 0.0;
     auto previousFrame = std::chrono::steady_clock::now();
+
+    const auto restart = [&]() {
+        position = options.position;
+        yaw = options.yawDegrees;
+        zombies = createZombies();
+        playerHealth = kPlayerMaxHealth;
+        kills = 0;
+        playerDead = false;
+        shootRequested = false;
+        shotCooldown = 0.0;
+        muzzleFlash = 0.0;
+        damageFlash = 0.0;
+        forwardIntent = 0.0;
+        strafeIntent = 0.0;
+        turnIntent = 0.0;
+    };
 
     while (running) {
         for (;;) {
@@ -1408,6 +2208,13 @@ int runInteractive(const Grid& map, Options options) {
                 case 'M':
                     minimap = !minimap;
                     break;
+                case ' ':
+                    shootRequested = true;
+                    break;
+                case 'r':
+                case 'R':
+                    restart();
+                    break;
                 case 'q':
                 case 'Q':
                 case 27:
@@ -1433,6 +2240,10 @@ int runInteractive(const Grid& map, Options options) {
                                : displayedFps * 0.9 + (1.0 / deltaSeconds) * 0.1;
         }
 
+        shotCooldown = std::max(0.0, shotCooldown - deltaSeconds);
+        muzzleFlash = std::max(0.0, muzzleFlash - deltaSeconds * 6.0);
+        damageFlash = std::max(0.0, damageFlash - deltaSeconds * 2.5);
+
         const double forwardStep = std::clamp(forwardIntent, -deltaSeconds, deltaSeconds);
         forwardIntent -= forwardStep;
         const double strafeStep = std::clamp(strafeIntent, -deltaSeconds, deltaSeconds);
@@ -1441,39 +2252,71 @@ int runInteractive(const Grid& map, Options options) {
         turnIntent -= turnStep;
 
         const Vec2 direction = directionFromDegrees(yaw);
-        if (std::fabs(forwardStep) > 0.0) {
-            const double amount = forwardStep * 2.6;
-            tryMove(map, position, Vec2{direction.x * amount, direction.y * amount});
-        }
-        if (std::fabs(strafeStep) > 0.0) {
-            const double amount = strafeStep * 2.1;
-            tryMove(map, position, Vec2{-direction.y * amount, direction.x * amount});
+        if (!playerDead) {
+            if (std::fabs(forwardStep) > 0.0) {
+                const double amount = forwardStep * 2.6;
+                tryMove(map, position, Vec2{direction.x * amount, direction.y * amount});
+            }
+            if (std::fabs(strafeStep) > 0.0) {
+                const double amount = strafeStep * 2.1;
+                tryMove(map, position, Vec2{-direction.y * amount, direction.x * amount});
+            }
         }
         if (std::fabs(turnStep) > 0.0) {
             yaw = normalizeDegrees(yaw + turnStep * 110.0);
         }
+
+        const int incomingDamage =
+            updateZombies(zombies, map, position, deltaSeconds, !playerDead);
+        if (incomingDamage > 0) {
+            playerHealth = std::max(0, playerHealth - incomingDamage);
+            damageFlash = 0.6;
+            if (playerHealth == 0) {
+                playerDead = true;
+            }
+        }
+
+        if (shootRequested && !playerDead && shotCooldown <= 0.0) {
+            shotCooldown = kShotCooldown;
+            muzzleFlash = 0.09;
+            const int target =
+                findShotTarget(zombies, map, position, directionFromDegrees(yaw));
+            if (target >= 0 &&
+                damageZombie(zombies[static_cast<std::size_t>(target)], kShotDamage)) {
+                ++kills;
+            }
+        }
+        shootRequested = false;
 
         const auto [columns, rows] = terminalSize();
         const int width = std::clamp(columns, 20, 400);
         const int sceneRows = std::clamp(rows - 1, 4, 200);
         const int height = sceneRows * 2;
         Image image(width, height);
-        if (mapMode) {
-            renderMapView(image, map, position, yaw, options.fovDegrees);
-        } else {
-            render3D(image, map, position, yaw, options.fovDegrees);
-            if (minimap) {
-                renderMinimap(image, map, position, yaw, options.fovDegrees);
-            }
+        renderWorld(image, map, position, yaw, options.fovDegrees, zombies, mapMode,
+                    minimap, muzzleFlash > 0.0);
+        if (damageFlash > 0.0) {
+            image.fillRect(0, 0, width, height, makeColor(150, 16, 16),
+                           std::min(0.28, damageFlash * 0.4));
         }
+        if (playerDead) {
+            image.fillRect(0, 0, width, height, makeColor(48, 0, 0), 0.35);
+        }
+        renderPlayerHud(image, playerHealth);
 
         std::string output = renderTerminalFrame(image);
         char status[512];
-        std::snprintf(status, sizeof(status),
-                      "  raycasting | x=%.1f y=%.1f yaw=%.0f | %s | fps=%.0f | WASD move, "
-                      "Left/Right turn | Tab rays | M minimap | Q quit",
-                      position.x, position.y, normalizeDegrees(yaw),
-                      mapMode ? "top-down ray view" : "3D view", displayedFps);
+        if (playerDead) {
+            std::snprintf(status, sizeof(status),
+                          "  raycasting | YOU DIED - press R to restart | kills=%d | Q quit",
+                          kills);
+        } else {
+            std::snprintf(status, sizeof(status),
+                          "  raycasting | HP %d | kills %d | %s | fps=%.0f | WASD move, "
+                          "Space shoot, Tab map, M minimap, R restart, Q quit",
+                          playerHealth, kills,
+                          mapMode ? "top-down ray view" : "3D view", displayedFps);
+        }
         std::string statusLine = status;
         if (static_cast<int>(statusLine.size()) > columns) {
             statusLine.resize(static_cast<std::size_t>(columns));
@@ -1541,18 +2384,11 @@ int main(int argc, char** argv) {
     }
 
     if (!options.renderPath.empty()) {
+        const std::vector<Zombie> zombies = createZombies();
         Image image(options.width, options.height);
-        if (options.mapView) {
-            renderMapView(image, map, options.position, options.yawDegrees,
-                          options.fovDegrees);
-        } else {
-            render3D(image, map, options.position, options.yawDegrees,
-                     options.fovDegrees);
-            if (options.minimap) {
-                renderMinimap(image, map, options.position, options.yawDegrees,
-                              options.fovDegrees);
-            }
-        }
+        renderWorld(image, map, options.position, options.yawDegrees, options.fovDegrees,
+                    zombies, options.mapView, options.minimap, false);
+        renderPlayerHud(image, kPlayerMaxHealth);
         if (!writePPM(options.renderPath, image)) {
             std::fprintf(stderr, "error: could not write %s\n",
                          options.renderPath.c_str());
