@@ -1,0 +1,28 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    env:
+      CXXFLAGS: -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Run built-in tests
+        run: make test
+
+      - name: Render a frame and convert it
+        run: |
+          ./raycasting --render /tmp/frame.ppm --width 320 --height 180 --minimap
+          python3 tools/ppm_to_png.py /tmp/frame.ppm /tmp/frame.png
+          test -s /tmp/frame.png
