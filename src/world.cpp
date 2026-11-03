@@ -91,9 +91,11 @@ void addParticle(Game& game, Vec2 position, double height, Vec2 velocity,
 
 void spawnBlood(Game& game, Vec2 position, Vec2 direction, int count) {
     const double baseAngle = std::atan2(direction.y, direction.x);
+    const int tick =
+        static_cast<int>(std::fmod(game.elapsed * 1000.0, 100000.0));
     for (int i = 0; i < count; ++i) {
-        const double a = noise01(i, 17, static_cast<int>(game.elapsed * 1000.0));
-        const double b = noise01(i, 29, static_cast<int>(game.elapsed * 1000.0) + 7);
+        const double a = noise01(i, 17, tick);
+        const double b = noise01(i, 29, tick + 7);
         const double angle = baseAngle + (a - 0.5) * 2.1;
         const double speed = 0.7 + b * 2.8;
         addParticle(game, position, 0.75 + a * 0.65,
@@ -105,9 +107,11 @@ void spawnBlood(Game& game, Vec2 position, Vec2 direction, int count) {
 
 void spawnDust(Game& game, Vec2 position, Vec2 direction, int count, bool trail) {
     const double baseAngle = std::atan2(direction.y, direction.x);
+    const int tick =
+        static_cast<int>(std::fmod(game.elapsed * 1000.0, 100000.0));
     for (int i = 0; i < count; ++i) {
-        const double a = noise01(i, 41, static_cast<int>(game.elapsed * 1000.0) + 3);
-        const double b = noise01(i, 53, static_cast<int>(game.elapsed * 1000.0) + 11);
+        const double a = noise01(i, 41, tick + 3);
+        const double b = noise01(i, 53, tick + 11);
         const double angle = baseAngle + kPi + (a - 0.5) * 1.3;
         const double speed = 0.35 + b * 1.2;
         addParticle(game, position, 0.12 + a * 0.35,
