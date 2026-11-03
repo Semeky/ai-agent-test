@@ -21,12 +21,14 @@ struct ViewVertex {
     Vec3 world;
     Vec3 normal;
     Vec2 uv;
+    double alpha = 1.0;
 };
 
 struct ScreenVertex {
     Vec3 world;
     Vec3 normal;
     Vec2 uv;
+    double alpha = 1.0;
     double x = 0.0;
     double y = 0.0;
     double invW = 0.0;
@@ -42,6 +44,7 @@ ViewVertex interpolateViewVertex(const ViewVertex& a, const ViewVertex& b, doubl
     result.world = a.world + (b.world - a.world) * t;
     result.normal = a.normal + (b.normal - a.normal) * t;
     result.uv = a.uv + (b.uv - a.uv) * t;
+    result.alpha = a.alpha + (b.alpha - a.alpha) * t;
     return result;
 }
 
@@ -316,7 +319,9 @@ void Mesh::addBox(Vec3 minimum, Vec3 maximum) {
             uvA, uvB);
 }
 
-void renderScene(Image& image, const Scene& scene) {
+namespace {
+
+void rasterizeScene(Image& image, const Scene& scene) {
     const int width = image.width();
     const int height = image.height();
     const double aspect = static_cast<double>(width) / static_cast<double>(height);
@@ -343,163 +348,265 @@ void renderScene(Image& image, const Scene& scene) {
     std::vector<ScreenVertex> screenPolygon;
     screenPolygon.reserve(8);
 
-    for (const DrawItem& item : scene.items) {
-        if (item.mesh == nullptr || item.mesh->triangles.empty()) {
-            continue;
-        }
-        const Mat4 modelView = view * item.model;
-        for (const Triangle& triangle : item.mesh->triangles) {
-            const Vertex* vertices[3] = {&triangle.v0, &triangle.v1, &triangle.v2};
-            Vec3 worldPositions[3];
-            for (int i = 0; i < 3; ++i) {
-                worldPositions[i] = transformPoint(item.model, vertices[i]->position);
-            }
-            Vec3 geometricNormal =
-                cross(worldPositions[1] - worldPositions[0],
-                      worldPositions[2] - worldPositions[0]);
-            if (lengthSquared(geometricNormal) < 1e-18) {
+    // Opaque geometry first, then transparent soft shadows and particles.
+    // The transparent pass still depth-tests against the opaque frame but does
+    // not write depth, so effects blend over what is behind them.
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool transparentPass = pass == 1;
+        for (const DrawItem& item : scene.items) {
+            if ((item.material.opacity < 0.999) != transparentPass) {
                 continue;
             }
-            geometricNormal = normalized(geometricNormal);
-            if (!item.material.doubleSided &&
-                dot(geometricNormal, camera.eye - worldPositions[0]) <= 0.0) {
+            if (item.mesh == nullptr || item.mesh->triangles.empty()) {
                 continue;
             }
-
-            polygon.clear();
-            for (int i = 0; i < 3; ++i) {
-                ViewVertex vertex;
-                vertex.view = transformPoint(modelView, vertices[i]->position);
-                vertex.world = worldPositions[i];
-                vertex.normal = normalized(
-                    transformDirection(item.model, vertices[i]->normal));
-                vertex.uv = vertices[i]->uv;
-                polygon.push_back(vertex);
-            }
-            clipAgainstNearPlane(polygon, camera.nearPlane, clipped);
-            if (clipped.size() < 3) {
-                continue;
-            }
-
-            screenPolygon.clear();
-            bool valid = true;
-            for (const ViewVertex& vertex : clipped) {
-                const Vec4 clip =
-                    projection * Vec4{vertex.view.x, vertex.view.y, vertex.view.z, 1.0};
-                if (clip.w <= 1e-9) {
-                    valid = false;
-                    break;
+            const Mat4 modelView = view * item.model;
+            for (const Triangle& triangle : item.mesh->triangles) {
+                const Vertex* vertices[3] = {&triangle.v0, &triangle.v1, &triangle.v2};
+                Vec3 worldPositions[3];
+                for (int i = 0; i < 3; ++i) {
+                    worldPositions[i] = transformPoint(item.model, vertices[i]->position);
                 }
-                ScreenVertex screen;
-                screen.world = vertex.world;
-                screen.normal = vertex.normal;
-                screen.uv = vertex.uv;
-                screen.invW = 1.0 / clip.w;
-                screen.x = (clip.x / clip.w * 0.5 + 0.5) * static_cast<double>(width);
-                screen.y = (0.5 - clip.y / clip.w * 0.5) * static_cast<double>(height);
-                screenPolygon.push_back(screen);
-            }
-            if (!valid) {
-                continue;
-            }
-
-            for (std::size_t fan = 1; fan + 1 < screenPolygon.size(); ++fan) {
-                const ScreenVertex& p0 = screenPolygon[0];
-                const ScreenVertex& p1 = screenPolygon[fan];
-                const ScreenVertex& p2 = screenPolygon[fan + 1];
-                const double area = edgeFunction(p0.x, p0.y, p1.x, p1.y, p2.x, p2.y);
-                if (std::fabs(area) < 1e-12) {
+                Vec3 geometricNormal =
+                    cross(worldPositions[1] - worldPositions[0],
+                          worldPositions[2] - worldPositions[0]);
+                if (lengthSquared(geometricNormal) < 1e-18) {
                     continue;
                 }
-                const double inverseArea = 1.0 / area;
-                const double minX = std::max(
-                    0.0, std::floor(std::min({p0.x, p1.x, p2.x})));
-                const double maxX = std::min(
-                    static_cast<double>(width - 1),
-                    std::ceil(std::max({p0.x, p1.x, p2.x})));
-                const double minY = std::max(
-                    0.0, std::floor(std::min({p0.y, p1.y, p2.y})));
-                const double maxY = std::min(
-                    static_cast<double>(height - 1),
-                    std::ceil(std::max({p0.y, p1.y, p2.y})));
-                if (minX > maxX || minY > maxY) {
+                geometricNormal = normalized(geometricNormal);
+                if (!item.material.doubleSided &&
+                    dot(geometricNormal, camera.eye - worldPositions[0]) <= 0.0) {
                     continue;
                 }
-                const int x0 = static_cast<int>(minX);
-                const int x1 = static_cast<int>(maxX);
-                const int y0 = static_cast<int>(minY);
-                const int y1 = static_cast<int>(maxY);
 
-                for (int y = y0; y <= y1; ++y) {
-                    const double py = static_cast<double>(y) + 0.5;
-                    const std::size_t row =
-                        static_cast<std::size_t>(y) * static_cast<std::size_t>(width);
-                    for (int x = x0; x <= x1; ++x) {
-                        const double px = static_cast<double>(x) + 0.5;
-                        double b0 = edgeFunction(p1.x, p1.y, p2.x, p2.y, px, py) *
-                                    inverseArea;
-                        double b1 = edgeFunction(p2.x, p2.y, p0.x, p0.y, px, py) *
-                                    inverseArea;
-                        double b2 = edgeFunction(p0.x, p0.y, p1.x, p1.y, px, py) *
-                                    inverseArea;
-                        // Barycentrics are edge/area, so they are positive
-                        // inside the triangle whatever the winding sign is.
-                        if (b0 < 0.0 || b1 < 0.0 || b2 < 0.0) {
-                            continue;
-                        }
-                        const double invW = b0 * p0.invW + b1 * p1.invW + b2 * p2.invW;
-                        if (invW <= 1e-12) {
-                            continue;
-                        }
-                        const std::size_t index = row + static_cast<std::size_t>(x);
-                        if (invW <= depth[index]) {
-                            continue;
-                        }
-                        const double scale = 1.0 / invW;
-                        const Vec3 world = (p0.world * (p0.invW * b0) +
-                                            p1.world * (p1.invW * b1) +
-                                            p2.world * (p2.invW * b2)) *
-                                           scale;
-                        const Vec3 normal = (p0.normal * (p0.invW * b0) +
-                                             p1.normal * (p1.invW * b1) +
-                                             p2.normal * (p2.invW * b2)) *
+                polygon.clear();
+                for (int i = 0; i < 3; ++i) {
+                    ViewVertex vertex;
+                    vertex.view = transformPoint(modelView, vertices[i]->position);
+                    vertex.world = worldPositions[i];
+                    vertex.normal = normalized(
+                        transformDirection(item.model, vertices[i]->normal));
+                    vertex.uv = vertices[i]->uv;
+                    vertex.alpha = vertices[i]->alpha;
+                    polygon.push_back(vertex);
+                }
+                clipAgainstNearPlane(polygon, camera.nearPlane, clipped);
+                if (clipped.size() < 3) {
+                    continue;
+                }
+
+                screenPolygon.clear();
+                bool valid = true;
+                for (const ViewVertex& vertex : clipped) {
+                    const Vec4 clip =
+                        projection * Vec4{vertex.view.x, vertex.view.y, vertex.view.z, 1.0};
+                    if (clip.w <= 1e-9) {
+                        valid = false;
+                        break;
+                    }
+                    ScreenVertex screen;
+                    screen.world = vertex.world;
+                    screen.normal = vertex.normal;
+                    screen.uv = vertex.uv;
+                    screen.alpha = vertex.alpha;
+                    screen.invW = 1.0 / clip.w;
+                    screen.x = (clip.x / clip.w * 0.5 + 0.5) * static_cast<double>(width);
+                    screen.y = (0.5 - clip.y / clip.w * 0.5) * static_cast<double>(height);
+                    screenPolygon.push_back(screen);
+                }
+                if (!valid) {
+                    continue;
+                }
+
+                for (std::size_t fan = 1; fan + 1 < screenPolygon.size(); ++fan) {
+                    const ScreenVertex& p0 = screenPolygon[0];
+                    const ScreenVertex& p1 = screenPolygon[fan];
+                    const ScreenVertex& p2 = screenPolygon[fan + 1];
+                    const double area = edgeFunction(p0.x, p0.y, p1.x, p1.y, p2.x, p2.y);
+                    if (std::fabs(area) < 1e-12) {
+                        continue;
+                    }
+                    const double inverseArea = 1.0 / area;
+                    const double minX = std::max(
+                        0.0, std::floor(std::min({p0.x, p1.x, p2.x})));
+                    const double maxX = std::min(
+                        static_cast<double>(width - 1),
+                        std::ceil(std::max({p0.x, p1.x, p2.x})));
+                    const double minY = std::max(
+                        0.0, std::floor(std::min({p0.y, p1.y, p2.y})));
+                    const double maxY = std::min(
+                        static_cast<double>(height - 1),
+                        std::ceil(std::max({p0.y, p1.y, p2.y})));
+                    if (minX > maxX || minY > maxY) {
+                        continue;
+                    }
+                    const int x0 = static_cast<int>(minX);
+                    const int x1 = static_cast<int>(maxX);
+                    const int y0 = static_cast<int>(minY);
+                    const int y1 = static_cast<int>(maxY);
+
+                    for (int y = y0; y <= y1; ++y) {
+                        const double py = static_cast<double>(y) + 0.5;
+                        const std::size_t row =
+                            static_cast<std::size_t>(y) * static_cast<std::size_t>(width);
+                        for (int x = x0; x <= x1; ++x) {
+                            const double px = static_cast<double>(x) + 0.5;
+                            double b0 = edgeFunction(p1.x, p1.y, p2.x, p2.y, px, py) *
+                                        inverseArea;
+                            double b1 = edgeFunction(p2.x, p2.y, p0.x, p0.y, px, py) *
+                                        inverseArea;
+                            double b2 = edgeFunction(p0.x, p0.y, p1.x, p1.y, px, py) *
+                                        inverseArea;
+                            // Barycentrics are edge/area, so they are positive
+                            // inside the triangle whatever the winding sign is.
+                            if (b0 < 0.0 || b1 < 0.0 || b2 < 0.0) {
+                                continue;
+                            }
+                            const double invW =
+                                b0 * p0.invW + b1 * p1.invW + b2 * p2.invW;
+                            if (invW <= 1e-12) {
+                                continue;
+                            }
+                            const std::size_t index =
+                                row + static_cast<std::size_t>(x);
+                            if (invW <= depth[index]) {
+                                continue;
+                            }
+                            const double alpha =
+                                (p0.alpha * (p0.invW * b0) +
+                                 p1.alpha * (p1.invW * b1) +
+                                 p2.alpha * (p2.invW * b2)) /
+                                invW;
+                            const double coverage =
+                                clampd(alpha, 0.0, 1.0) * item.material.opacity;
+                            if (coverage <= 0.002) {
+                                continue;
+                            }
+                            const double scale = 1.0 / invW;
+                            const Vec3 world = (p0.world * (p0.invW * b0) +
+                                                p1.world * (p1.invW * b1) +
+                                                p2.world * (p2.invW * b2)) *
+                                               scale;
+                            const Vec3 normal = (p0.normal * (p0.invW * b0) +
+                                                 p1.normal * (p1.invW * b1) +
+                                                 p2.normal * (p2.invW * b2)) *
+                                                scale;
+                            const Vec2 uv = (p0.uv * (p0.invW * b0) +
+                                             p1.uv * (p1.invW * b1) +
+                                             p2.uv * (p2.invW * b2)) *
                                             scale;
-                        const Vec2 uv = (p0.uv * (p0.invW * b0) +
-                                         p1.uv * (p1.invW * b1) +
-                                         p2.uv * (p2.invW * b2)) *
-                                        scale;
-                        const double distance = length(world - camera.eye);
-                        const double lod = std::log2(
-                            std::max(1.0, distance * lodScale));
-                        Color albedo = item.material.texture != nullptr
-                                           ? item.material.texture->sample(uv.x, uv.y, lod)
-                                           : makeColor(255, 255, 255);
-                        albedo = multiply(albedo, item.material.tint);
-                        if (!item.material.unlit) {
-                            const Vec3 unitNormal = normalized(normal);
-                            const double diffuse =
-                                std::max(0.0, dot(unitNormal, lightDirection)) *
-                                    scene.light.intensity +
-                                std::max(0.0, -unitNormal.z) * 0.25;
-                            const double red = scene.ambient + diffuse * lightRed;
-                            const double green = scene.ambient + diffuse * lightGreen;
-                            const double blue = scene.ambient + diffuse * lightBlue;
-                            albedo = makeColor(
-                                static_cast<int>(albedo.r * red),
-                                static_cast<int>(albedo.g * green),
-                                static_cast<int>(albedo.b * blue));
-                            const double fog =
-                                smoothstep(scene.fogStart, scene.fogEnd, distance) *
-                                scene.fogMaximum;
-                            albedo = mix(albedo, scene.fogColor, fog);
+                            const double distance = length(world - camera.eye);
+                            const double lod = std::log2(
+                                std::max(1.0, distance * lodScale));
+                            Color albedo = item.material.texture != nullptr
+                                               ? item.material.texture->sample(uv.x, uv.y, lod)
+                                               : makeColor(255, 255, 255);
+                            albedo = multiply(albedo, item.material.tint);
+                            if (!item.material.unlit) {
+                                const Vec3 unitNormal = normalized(normal);
+                                const Vec3 unitView =
+                                    distance > 1e-9
+                                        ? (camera.eye - world) / distance
+                                        : Vec3{0.0, 0.0, 1.0};
+                                const double ndotl =
+                                    std::max(0.0, dot(unitNormal, lightDirection));
+                                const double diffuse =
+                                    ndotl * scene.light.intensity +
+                                    std::max(0.0, -unitNormal.z) * 0.25;
+                                // Blinn-Phong highlight; the half vector between
+                                // the light and the eye gives a stable, cheap
+                                // specular lobe for every material.
+                                double highlight = 0.0;
+                                if (item.material.specular > 0.0 && ndotl > 0.0) {
+                                    const Vec3 halfVector = normalized(
+                                        lightDirection + unitView);
+                                    highlight =
+                                        std::pow(std::max(0.0,
+                                                          dot(unitNormal, halfVector)),
+                                                 std::max(1.0, item.material.shininess)) *
+                                        item.material.specular *
+                                        scene.light.intensity;
+                                }
+                                const double red =
+                                    scene.ambient + diffuse * lightRed;
+                                const double green =
+                                    scene.ambient + diffuse * lightGreen;
+                                const double blue =
+                                    scene.ambient + diffuse * lightBlue;
+                                albedo = makeColor(
+                                    static_cast<int>(albedo.r * red +
+                                                     highlight * 255.0 * lightRed),
+                                    static_cast<int>(albedo.g * green +
+                                                     highlight * 255.0 * lightGreen),
+                                    static_cast<int>(albedo.b * blue +
+                                                     highlight * 255.0 * lightBlue));
+                                const double fog =
+                                    smoothstep(scene.fogStart, scene.fogEnd, distance) *
+                                    scene.fogMaximum;
+                                albedo = mix(albedo, scene.fogColor, fog);
+                            }
+                            if (coverage >= 0.999) {
+                                image.at(x, y) = albedo;
+                            } else {
+                                image.at(x, y) = mix(image.at(x, y), albedo, coverage);
+                            }
+                            if (!transparentPass) {
+                                depth[index] = invW;
+                            }
                         }
-                        image.at(x, y) = albedo;
-                        depth[index] = invW;
                     }
                 }
             }
         }
     }
+}
+
+// Box-filter the supersampled frame down to the requested resolution.  Every
+// source sample contributes equally, which keeps flat areas exactly as they
+// were and turns triangle and texture edges into smooth coverage blends.
+void resolveSupersampled(const Image& source, Image& target, int factor) {
+    const int samples = factor * factor;
+    for (int y = 0; y < target.height(); ++y) {
+        for (int x = 0; x < target.width(); ++x) {
+            int red = 0;
+            int green = 0;
+            int blue = 0;
+            for (int sampleY = 0; sampleY < factor; ++sampleY) {
+                for (int sampleX = 0; sampleX < factor; ++sampleX) {
+                    const Color& color =
+                        source.at(x * factor + sampleX, y * factor + sampleY);
+                    red += color.r;
+                    green += color.g;
+                    blue += color.b;
+                }
+            }
+            target.at(x, y) = makeColor((red + samples / 2) / samples,
+                                        (green + samples / 2) / samples,
+                                        (blue + samples / 2) / samples);
+        }
+    }
+}
+
+}  // namespace
+
+void renderScene(Image& image, const Scene& scene) {
+    int supersamples = std::clamp(scene.supersamples, 1, 4);
+    // Keep the offscreen sample buffer bounded: at most about four million
+    // supersampled pixels, which is 2x2 at 960x540 and 1x at 4K.
+    const double pixelCount =
+        static_cast<double>(image.width()) * static_cast<double>(image.height());
+    while (supersamples > 1 &&
+           pixelCount * static_cast<double>(supersamples * supersamples) >
+               4200000.0) {
+        --supersamples;
+    }
+    if (supersamples <= 1) {
+        rasterizeScene(image, scene);
+        return;
+    }
+    Image supersampled(image.width() * supersamples, image.height() * supersamples);
+    rasterizeScene(supersampled, scene);
+    resolveSupersampled(supersampled, image, supersamples);
 }
 
 void applyRadialBlur(Image& image, double strength) {
