@@ -1533,7 +1533,7 @@ void appendZombies(Scene& scene, const Game& game, const ZombieAssets& assets,
                         scaleMatrix(Vec3{0.55 + 0.35 * settle,
                                          0.40 + 0.25 * settle, 1.0}),
                     mix(makeColor(80, 8, 8), makeColor(138, 22, 14), settle), true,
-                    nullptr, 0.0, 32.0, 0.9);
+                    nullptr, 0.0, 32.0, 0.9 * fade);
             addPart(scene, assets.shadow,
                     translationMatrix(mapToWorld(zombie.position, 0.018)) *
                         scaleMatrix(Vec3{0.50, 0.34, 1.0}),
