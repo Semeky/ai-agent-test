@@ -8,17 +8,19 @@ Repository for Superagent tasks.
 the classic Wolfenstein-style ray casting renderer. It casts one ray per screen
 column with DDA grid traversal, projects the hits into textured and fog-shaded
 vertical wall slices, casts a textured floor and ceiling, and draws the actual
-ray fan in a top-down view so the algorithm can be inspected directly.
+ray fan in a top-down view so the algorithm can be inspected directly. A small
+combat layer adds zombies: depth-tested billboards with health bars that shamble
+toward the player.
 
 ![First-person ray casting view](docs/raycasting-3d.png)
 
-*First-person view with the minimap enabled. The minimap draws the rays that
-produced the frame.*
+*First-person view with the minimap enabled. A zombie is closing in: the bar
+above its head is its health, the bar in the bottom-left corner is the player's.*
 
 ![Top-down map with the ray fan](docs/raycasting-rays.png)
 
-*The `--map` view: the 24x24 grid, the player, five wall materials and the cast
-ray fan.*
+*The `--map` view: the 24x24 grid, the player, five wall materials, the cast
+ray fan and red zombie markers with their health bars.*
 
 ### Build and run
 
@@ -37,8 +39,10 @@ The demo opens in an interactive first-person view.
 | `W`/`S` or `Up`/`Down` | Move forward/backward |
 | `A`/`D` | Strafe left/right |
 | `Left`/`Right` | Turn |
+| `Space` | Fire at the zombie under the crosshair |
 | `Tab` | Toggle the top-down ray view |
 | `M` | Toggle the minimap |
+| `R` | Restart the demo |
 | `Q`/`Esc` | Quit |
 
 ### Rendering frames and screenshots
@@ -82,11 +86,22 @@ Useful options (also listed by `./raycasting --help`):
   constant distance to the floor (or ceiling) plane, so world-space texture
   coordinates can be interpolated linearly across the row: perspective-correct
   floor and ceiling casting without extra ray casts.
-- **Top-down view.** Draws the map, the player and the cast ray fan, and
-  highlights the wall cells the rays hit.
+- **Top-down view.** Draws the map, the player, the zombies and the cast ray
+  fan, and highlights the wall cells the rays hit.
+- **Zombies.** Six zombies spawn at fixed walkable positions. Each is a 32x64
+  procedural billboard projected into camera space; a per-column wall depth
+  buffer hides the parts that are behind walls. When the player is close and in
+  sight, a zombie walks toward them and attacks in melee. `Space` fires a
+  hitscan along the crosshair: walls block the shot, a hit flashes the zombie
+  and drains its health bar. Dead zombies respawn after a few seconds, and the
+  player's own health is shown in the bottom-left corner.
+- **Health bars.** A zombie's bar is drawn above its head, colour-coded green,
+  amber or red to match its remaining health, and it is depth-tested against
+  the same wall buffer as the sprite.
 - **Tests.** `--selftest` checks map invariants, compares 1200 random DDA casts
-  with an independent brute-force ray march, exercises axis-aligned rays and
-  verifies the PPM writer.
+  with an independent brute-force ray march, exercises axis-aligned rays,
+  verifies the PPM writer and covers the zombie layer: walkable spawns, hitscan
+  hits, walls blocking shots, billboard occlusion and health-bar colours.
 
 ### Verification
 
