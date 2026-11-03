@@ -2,25 +2,31 @@
 
 Repository for Superagent tasks.
 
-## C++ ray casting demo
+## Museum 3D
 
-[`raycasting.cpp`](raycasting.cpp) is a dependency-free C++17 implementation of
-the classic Wolfenstein-style ray casting renderer. It casts one ray per screen
-column with DDA grid traversal, projects the hits into textured and fog-shaded
-vertical wall slices, casts a textured floor and ceiling, and draws the actual
-ray fan in a top-down view so the algorithm can be inspected directly. A small
-combat layer adds zombies: depth-tested billboards with health bars that shamble
-toward the player.
+`game3d` is a dependency-free C++17 3D game. It replaces the repository's ray
+casting renderer with a real software 3D pipeline: model, view and projection
+transforms, near-plane clipping, perspective divide, depth-buffered triangle
+rasterization, perspective-correct texture mapping with mip levels, directional
+lighting and distance fog. The museum map, zombie combat and controls from the
+old demo are preserved, and two drivable cars have been added to the map.
 
-![First-person ray casting view](docs/raycasting-3d.png)
+![First-person 3D view](docs/3d-first-person.png)
 
-*First-person view with the minimap enabled. A zombie is closing in: the bar
-above its head is its health, the bar in the bottom-left corner is the player's.*
+*First-person view at the default spawn with the minimap enabled. The orange car
+is parked ahead, a zombie is closing in, and its health bar is drawn as a
+depth-tested 3D billboard.*
 
-![Top-down map with the ray fan](docs/raycasting-rays.png)
+![Overhead 3D map view](docs/3d-overhead.png)
 
-*The `--map` view: the 24x24 grid, the player, five wall materials, the cast
-ray fan and red zombie markers with their health bars.*
+*The `--map` camera: a real overhead 3D view of the museum. Room shapes,
+interiors, wall tops, the fountain and both cars are visible; there is no ray
+fan or other 2D projection.*
+
+![Driving view](docs/3d-driving.png)
+
+*Driving vehicle 0 with the wall-aware third-person chase camera. The speed
+meter is in the bottom-right corner.*
 
 ### Build and run
 
@@ -29,40 +35,48 @@ with 24-bit color support (Linux, macOS, WSL and most modern terminals qualify).
 
 ```sh
 make
-./raycasting
+./game3d
 ```
 
 The demo opens in an interactive first-person view.
 
-| Input | Action |
-| --- | --- |
-| `W`/`S` or `Up`/`Down` | Move forward/backward |
-| `A`/`D` | Strafe left/right |
-| `Left`/`Right` | Turn |
-| `Space` | Fire at the zombie under the crosshair |
-| `Tab` | Toggle the top-down ray view |
-| `M` | Toggle the minimap |
-| `R` | Restart the demo |
-| `Q`/`Esc` | Quit |
+| Input | On foot | In a vehicle |
+| --- | --- | --- |
+| `W`/`S` or `Up`/`Down` | Move forward/backward | Accelerate / brake and reverse |
+| `A`/`D` | Strafe left/right | Steer left/right |
+| `Left`/`Right` | Turn | Steer left/right |
+| `E` | Enter a nearby vehicle | Exit the vehicle |
+| `Space` | Fire at the zombie under the crosshair | — |
+| `Tab` | Toggle the overhead 3D map | Toggle the overhead 3D map |
+| `M` | Toggle the minimap | Toggle the minimap |
+| `R` | Restart | Restart |
+| `Q`/`Esc` | Quit | Quit |
+
+Vehicles can only be entered or exited when slow enough to stop safely; the
+player is placed on walkable ground when leaving a car.
 
 ### Rendering frames and screenshots
 
 ```sh
-./raycasting --render frame.ppm --width 960 --height 540 --minimap
-./raycasting --render rays.ppm --width 960 --height 540 --map
+./game3d --render frame.ppm --width 960 --height 540 --minimap
+./game3d --render map.ppm --width 960 --height 540 --map
+./game3d --render drive.ppm --width 960 --height 540 --drive 0
 python3 tools/ppm_to_png.py frame.ppm frame.png
 ```
 
-`make screenshots` regenerates the two images above; the PNG converter uses
-only the Python standard library.
+`make screenshots` regenerates the three images above; the PNG converter uses
+only the Python standard library. Rendering a 960x540 frame takes roughly 0.2 s
+on a current laptop CPU, and interactive frames use the much smaller terminal
+resolution.
 
-Useful options (also listed by `./raycasting --help`):
+Useful options (also listed by `./game3d --help`):
 
 | Option | Meaning |
 | --- | --- |
 | `--render <file.ppm>` | Render one frame and exit |
-| `--map` | Top-down ray view |
-| `--minimap` | Draw the minimap in the 3D view |
+| `--map` | Overhead 3D map view |
+| `--minimap` | Draw the minimap in the first-person view |
+| `--drive <n>` | Start inside vehicle `n` (0-based) |
 | `--width`, `--height` | Output size (default 960x540) |
 | `--fov <deg>` | Horizontal field of view (default 75) |
 | `--pos <x>,<y>` | Start position (default 6.5,14.5) |
@@ -72,36 +86,43 @@ Useful options (also listed by `./raycasting --help`):
 
 ### How it works
 
-- **Map.** A 24x24 grid of five wall materials forms a small museum: four
-  colored rooms around a brick inner hall with stone pillars and a golden
-  fountain.
-- **Ray casting.** For each screen column a ray is cast through the camera
-  plane. The DDA walk visits grid cells in order and returns the first wall, its
-  perpendicular distance, the wall side and a texture coordinate. Using
-  perpendicular distance avoids fisheye distortion.
-- **Projection.** The distance determines the height of a vertical wall slice.
-  Slices sample 64x64 procedural textures, get side shading and blend into the
-  distance fog.
-- **Floor and ceiling.** Every screen row below (or above) the horizon has a
-  constant distance to the floor (or ceiling) plane, so world-space texture
-  coordinates can be interpolated linearly across the row: perspective-correct
-  floor and ceiling casting without extra ray casts.
-- **Top-down view.** Draws the map, the player, the zombies and the cast ray
-  fan, and highlights the wall cells the rays hit.
-- **Zombies.** Six zombies spawn at fixed walkable positions. Each is a 32x64
-  procedural billboard projected into camera space; a per-column wall depth
-  buffer hides the parts that are behind walls. When the player is close and in
-  sight, a zombie walks toward them and attacks in melee. `Space` fires a
-  hitscan along the crosshair: walls block the shot, a hit flashes the zombie
-  and drains its health bar. Dead zombies respawn after a few seconds, and the
-  player's own health is shown in the bottom-left corner.
-- **Health bars.** A zombie's bar is drawn above its head, colour-coded green,
-  amber or red to match its remaining health, and it is depth-tested against
-  the same wall buffer as the sprite.
-- **Tests.** `--selftest` checks map invariants, compares 1200 random DDA casts
-  with an independent brute-force ray march, exercises axis-aligned rays,
-  verifies the PPM writer and covers the zombie layer: walkable spawns, hitscan
-  hits, walls blocking shots, billboard occlusion and health-bar colours.
+- **Rendering pipeline.** Geometry is submitted as triangle meshes with a model
+  matrix and a material. Every vertex goes through model, view and projection
+  transforms; triangles are back-face culled in world space and clipped against
+  the near plane in view space. Clipped polygons are fan-triangulated, projected
+  to the viewport and rasterized with an edge-function scan converter. A
+  reciprocal-w depth buffer resolves occlusion, while `1/w`-weighted
+  interpolation keeps world position, normals and UVs perspective-correct.
+- **Textures and lighting.** Materials sample tiling procedural textures
+  (brick, stone, painted panels, wood, gold, water, floor and ceiling) with
+  bilinear filtering and an automatically generated mip chain. A directional
+  light, ambient term and small ceiling bounce term shade each pixel, and
+  distance fog fades the far end of the museum.
+- **Map.** The original 24x24 grid with five wall materials is unchanged. It is
+  extruded into 3D: exposed wall faces are generated per grid cell, wall tops
+  are included for the overhead camera, the floor and ceiling are textured
+  planes, and the golden fountain is a low water basin. Rooms, doorways,
+  pillars and the layout match the previous demo.
+- **Zombies.** Zombies are articulated low-poly models (torso, head, arms and a
+  two-frame walk swing) instead of sprites. A depth-tested 3D billboard health
+  bar follows each living zombie. Los-blocked zombies shuffle toward the player,
+  attack in melee, respawn after a few seconds and can be shot with the same
+  hitscan rules as before.
+- **Vehicles.** Two cars are parked in the atrium. Each is built from boxes and
+  twelve-sided wheel cylinders, with paint, glass, headlights, tail lights and a
+  ground shadow. Driving uses an arcade bicycle model: throttle acceleration,
+  braking, reverse, drag, speed-sensitive steering and a speed cap. Front wheels
+  steer and all wheels spin. Collision uses a two-circle hull against the grid:
+  blocked movement slides along walls, frontal impacts damp the speed, turning
+  into a wall is rejected, cars cannot overlap each other, and zombies are
+  pushed out of a car's hull. The chase camera shortens its boom when a wall is
+  behind the car, so it stays inside the museum.
+- **Gameplay rays.** The renderer no longer uses ray casting. A grid DDA routine
+  remains in the simulation for line-of-sight checks, zombie hitscan and
+  third-person camera clearance; it never produces pixels.
+- **HUD.** The player health bar, crosshair, minimap (now with vehicle markers)
+  and driving speed meter are drawn directly into the frame buffer after the 3D
+  pass. Damage, death and muzzle flashes are preserved.
 
 ### Verification
 
@@ -109,6 +130,28 @@ Useful options (also listed by `./raycasting --help`):
 make test
 ```
 
-The demo also builds cleanly with `-Wall -Wextra -Wpedantic -Werror`; the
-GitHub Actions workflow in `.github/workflows/build.yml` builds, runs the
-selftest and renders a frame.
+The built-in selftest checks matrix/projection math, texture sampling and mip
+levels, rasterization, depth buffering, back-face culling, near-plane clipping,
+map and spawn invariants, 1200 random gameplay rays against a brute-force march,
+zombie hitscan/occlusion/chase/melee/respawn behaviour, vehicle entry/exit,
+acceleration, braking, reverse, steering, speed caps, wall and car collisions,
+first-person/chase/overhead rendering, zombie depth occlusion and PPM output.
+
+The project builds cleanly with `-Wall -Wextra -Wpedantic -Werror`. The GitHub
+Actions workflow in `.github/workflows/build.yml` builds it, runs the selftest
+and renders all three views.
+
+### Migration notes
+
+The old `raycasting.cpp` renderer and its per-column DDA wall slices, floor
+casting, sprite depth buffer and ray-fan map have been removed. The map layout,
+spawn point, movement and combat controls, zombie behavior, health bars and
+minimap were carried over. The top-down ray view was replaced by a real overhead
+3D camera, and the minimap now also shows vehicles.
+
+Because the project is a dependency-free terminal application, "equivalent for
+your stack" means implementing the same pipeline stages WebGL/Three.js would
+drive on a GPU, in software on the CPU. It keeps the existing build, selftest,
+CI and PPM screenshot workflow without adding a browser or graphics runtime.
+The pre-migration screenshots remain available in git history at commit
+`7d725db`.
