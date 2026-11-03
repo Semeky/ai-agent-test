@@ -164,6 +164,11 @@ struct Scene {
 
 void renderScene(Image& image, const Scene& scene);
 
+// Radial screen-space blur used by the dash speed effect.  Samples are pulled
+// toward the image centre; strength is the fraction of the centre distance
+// sampled by the outermost tap.
+void applyRadialBlur(Image& image, double strength);
+
 // Camera basis helpers for billboards and other view-facing geometry.
 struct CameraBasis {
     Vec3 forward;

@@ -10,6 +10,91 @@ Vec2 directionFromRadians(double radians) {
     return Vec2{std::cos(radians), std::sin(radians)};
 }
 
+const std::uint8_t kDigitGlyphs[10][5] = {
+    {7, 5, 5, 5, 7},  // 0
+    {2, 6, 2, 2, 7},  // 1
+    {7, 1, 7, 4, 7},  // 2
+    {7, 1, 7, 1, 7},  // 3
+    {5, 5, 7, 1, 1},  // 4
+    {7, 4, 7, 1, 7},  // 5
+    {7, 4, 7, 5, 7},  // 6
+    {7, 1, 1, 2, 2},  // 7
+    {7, 5, 7, 5, 7},  // 8
+    {7, 5, 7, 1, 7},  // 9
+};
+const std::uint8_t kComboGlyph[5] = {5, 5, 2, 5, 5};
+
+void drawGlyph(Image& image, int x, int y, const std::uint8_t rows[5], int scale,
+               Color color) {
+    for (int row = 0; row < 5; ++row) {
+        for (int column = 0; column < 3; ++column) {
+            if ((rows[row] & static_cast<std::uint8_t>(1U << (2 - column))) != 0) {
+                image.fillRect(x + column * scale, y + row * scale, scale, scale,
+                               color);
+            }
+        }
+    }
+}
+
+void drawNumberRight(Image& image, int rightX, int y, int value, int scale,
+                     Color color) {
+    int number = std::max(0, value);
+    int digits[12] = {};
+    int count = 0;
+    do {
+        digits[count++] = number % 10;
+        number /= 10;
+    } while (number > 0 && count < 12);
+    const int pitch = 4 * scale;
+    int x = rightX - (count * pitch - scale);
+    for (int i = count - 1; i >= 0; --i) {
+        drawGlyph(image, x, y, kDigitGlyphs[digits[i]], scale, color);
+        x += pitch;
+    }
+}
+
+void paintDashMeter(Image& image, const Game& game, int x, int y, int width,
+                    int height) {
+    const int unit = std::max(2, height / 3);
+    const int iconWidth = 3 * unit;
+    image.fillRect(x - 8, y - 6, width + iconWidth + 30, height + 12,
+                   makeColor(5, 7, 10), 0.55);
+
+    const bool dashing = game.player.dashTimer > 0.0;
+    const bool ready = dashReady(game);
+    const Color color = dashing ? makeColor(255, 246, 214)
+                                : (ready ? makeColor(92, 226, 232)
+                                         : makeColor(214, 150, 66));
+    const int iconY = y + std::max(0, (height - 5 * unit) / 2);
+    image.fillRect(x + 2 * unit, iconY, unit, unit, color);
+    image.fillRect(x + unit, iconY + unit, 2 * unit, unit, color);
+    image.fillRect(x, iconY + 2 * unit, 3 * unit, unit, color);
+    image.fillRect(x + unit, iconY + 3 * unit, 2 * unit, unit, color);
+    image.fillRect(x + 2 * unit, iconY + 4 * unit, unit, unit, color);
+
+    const int barX = x + iconWidth + 8;
+    image.fillRect(barX, y, width, height, makeColor(28, 34, 42));
+    double fraction = 0.0;
+    if (dashing) {
+        fraction = clampd(game.player.dashTimer / kDashDuration, 0.0, 1.0);
+    } else if (ready) {
+        fraction = 1.0;
+    } else {
+        fraction = clampd(1.0 - game.player.dashCooldown / kDashCooldown, 0.0, 1.0);
+    }
+    image.fillRect(barX, y, static_cast<int>(std::lround(width * fraction)), height,
+                   color);
+    for (int tick = 1; tick < 4; ++tick) {
+        image.fillRect(barX + width * tick / 4, y, 1, height,
+                       makeColor(8, 10, 14), 0.85);
+    }
+    if (ready) {
+        const double pulse = 0.22 + 0.18 * std::sin(game.elapsed * 7.0);
+        image.fillRect(barX - 1, y - 1, width + 2, 1, color, pulse);
+        image.fillRect(barX - 1, y + height, width + 2, 1, color, pulse);
+    }
+}
+
 void paintMapCells(Image& image, const Grid& map, int offsetX, int offsetY, int scale) {
     for (int y = 0; y < kMapHeight; ++y) {
         for (int x = 0; x < kMapWidth; ++x) {
@@ -124,6 +209,31 @@ void drawPlayerHud(Image& image, const Game& game) {
     drawHealthBar(image, x + iconSize + 8, y, barWidth, barHeight,
                   static_cast<double>(game.player.health) / kPlayerMaxHealth);
 
+    if (!game.player.inVehicle) {
+        const int dashWidth = std::clamp(barWidth * 3 / 5, 64, 150);
+        const int dashHeight = std::max(4, barHeight - 2);
+        paintDashMeter(image, game, x, y - barHeight - 17, dashWidth, dashHeight);
+    }
+
+    const int scoreScale = std::clamp(image.width() / 320, 2, 4);
+    const int scoreRight = image.width() - 14;
+    const int scoreY = 14;
+    const std::string scoreText = std::to_string(std::max(0, game.score));
+    const int scoreWidth = static_cast<int>(scoreText.size()) * 4 * scoreScale -
+                           scoreScale;
+    image.fillRect(scoreRight - scoreWidth - 10, scoreY - 7, scoreWidth + 20,
+                   5 * scoreScale + 14, makeColor(5, 7, 10), 0.55);
+    drawNumberRight(image, scoreRight, scoreY, game.score, scoreScale,
+                    makeColor(255, 206, 104));
+    if (game.combo > 1) {
+        const int comboY = scoreY + 5 * scoreScale + 9;
+        const int comboRight = scoreRight;
+        drawGlyph(image, comboRight - 7 * scoreScale, comboY, kComboGlyph,
+                  scoreScale, makeColor(120, 240, 244));
+        drawNumberRight(image, comboRight, comboY, game.combo, scoreScale,
+                        makeColor(120, 240, 244));
+    }
+
     if (!game.player.inVehicle || game.player.vehicleIndex < 0 ||
         game.player.vehicleIndex >= static_cast<int>(game.vehicles.size())) {
         return;
@@ -196,6 +306,39 @@ void drawMinimap(Image& image, const Game& game) {
         paintPlayerMarker(image, game.player.position, game.player.yawDegrees, offsetX,
                           offsetY, scale);
     }
+}
+
+void drawDashEffects(Image& image, const Game& game) {
+    if (game.player.inVehicle || game.player.dashTimer <= 0.0) {
+        return;
+    }
+    const double intensity =
+        clampd(game.player.dashTimer / kDashDuration, 0.0, 1.0);
+    const int centerX = image.width() / 2;
+    const int centerY = image.height() / 2;
+    const double radius =
+        std::hypot(static_cast<double>(image.width()),
+                   static_cast<double>(image.height())) *
+        0.58;
+    constexpr int lineCount = 26;
+    for (int i = 0; i < lineCount; ++i) {
+        const double wobble =
+            std::sin(game.elapsed * 21.0 + static_cast<double>(i) * 2.37);
+        const double angle =
+            2.0 * kPi * static_cast<double>(i) / lineCount + wobble * 0.035;
+        const double inner = radius * (0.30 + 0.10 * wobble);
+        const double outer = radius * (0.66 + 0.18 * wobble);
+        const Color color =
+            i % 4 == 0 ? makeColor(255, 204, 118) : makeColor(235, 246, 255);
+        image.drawLine(
+            centerX + static_cast<int>(std::lround(std::cos(angle) * inner)),
+            centerY + static_cast<int>(std::lround(std::sin(angle) * inner)),
+            centerX + static_cast<int>(std::lround(std::cos(angle) * outer)),
+            centerY + static_cast<int>(std::lround(std::sin(angle) * outer)), color,
+            intensity * (0.10 + 0.12 * std::fabs(wobble)));
+    }
+    image.fillRect(0, 0, image.width(), image.height(), makeColor(255, 196, 96),
+                   intensity * 0.035);
 }
 
 }  // namespace g3d

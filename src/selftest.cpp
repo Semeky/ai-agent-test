@@ -103,6 +103,7 @@ void renderGameFrame(Image& image, const Game& game, const TestAssets& assets,
     if (withEntities) {
         appendVehicles(scene, game, assets.vehicles);
         appendZombies(scene, game, assets.zombies, !mapMode);
+        appendParticles(scene, game, assets.world);
     }
     renderScene(image, scene);
 }
@@ -402,8 +403,10 @@ bool selftestWeaponsAndZombies(std::string& error) {
 
     Zombie target;
     target.spawn = target.position = Vec2{4.5, 14.5};
-    if (findShotTarget(Game{game.map, game.player, game.vehicles, {target}}, kSpawn,
-                       Vec2{-1.0, 0.0}) != -1) {
+    Game wallGame = createGame();
+    wallGame.zombies.clear();
+    wallGame.zombies.push_back(target);
+    if (findShotTarget(wallGame, kSpawn, Vec2{-1.0, 0.0}) != -1) {
         error = "a shot passed through a wall";
         return false;
     }
@@ -628,6 +631,235 @@ bool selftestVehicles(const Grid& map, std::string& error) {
     return true;
 }
 
+bool selftestDash(std::string& error) {
+    Game game = createGame();
+    game.vehicles.clear();
+    game.zombies.clear();
+    game.player.position = Vec2{6.5, 14.5};
+    game.player.yawDegrees = 0.0;
+    if (!dashReady(game)) {
+        error = "dash is not ready at spawn";
+        return false;
+    }
+    if (!startDash(game, Vec2{1.0, 0.0})) {
+        error = "the dash did not start";
+        return false;
+    }
+    if (game.player.dashTimer <= 0.0 || game.player.dashCooldown <= 0.0) {
+        error = "the dash did not set its timer and cooldown";
+        return false;
+    }
+    if (game.soundEvents.empty() || game.soundEvents.back() != SoundEvent::Dash) {
+        error = "the dash did not queue its audio event";
+        return false;
+    }
+    const Vec2 start = game.player.position;
+    for (int frame = 0; frame < 5; ++frame) {
+        updateGame(game, Input{}, 1.0 / 60.0);
+    }
+    if (length(game.player.position - start) < 0.7) {
+        error = "the dash did not move the player fast enough";
+        return false;
+    }
+    if (game.player.dashTimer <= 0.0) {
+        error = "the dash ended too early";
+        return false;
+    }
+    if (startDash(game, Vec2{1.0, 0.0})) {
+        error = "a second dash ignored the cooldown";
+        return false;
+    }
+    for (int frame = 0; frame < 140; ++frame) {
+        updateGame(game, Input{}, 1.0 / 60.0);
+    }
+    if (!dashReady(game)) {
+        error = "the dash cooldown does not recover";
+        return false;
+    }
+
+    // A dash that hits a zombie damages it, awards score and spawns effects.
+    Game combat = createGame();
+    combat.vehicles.clear();
+    combat.zombies.clear();
+    combat.player.position = Vec2{6.5, 14.5};
+    combat.player.yawDegrees = 0.0;
+    Zombie target;
+    target.spawn = target.position = Vec2{7.2, 14.5};
+    target.health = 55;
+    target.maxHealth = kZombieMaxHealth;
+    combat.zombies.push_back(target);
+    Input dashInput;
+    dashInput.dash = true;
+    dashInput.dashDirection = Vec2{1.0, 0.0};
+    updateGame(combat, dashInput, 1.0 / 60.0);
+    for (int frame = 0; frame < 5; ++frame) {
+        updateGame(combat, Input{}, 1.0 / 60.0);
+    }
+    if (!combat.zombies[0].ragdoll) {
+        error = "a dash hit did not kill a damaged zombie";
+        return false;
+    }
+    if (combat.kills != 1 || combat.score <= 0) {
+        error = "a dash kill did not award kills and score";
+        return false;
+    }
+    if (combat.particles.empty()) {
+        error = "a dash kill did not spawn blood or dust particles";
+        return false;
+    }
+    if (combat.zombies[0].flattened) {
+        error = "a dash kill was flattened like a vehicle impact";
+        return false;
+    }
+
+    // A low frame rate must not tunnel the dash through a zombie.
+    Game sweep = createGame();
+    sweep.vehicles.clear();
+    sweep.zombies.clear();
+    sweep.player.position = Vec2{6.5, 14.5};
+    sweep.player.yawDegrees = 0.0;
+    Zombie middle;
+    middle.spawn = middle.position = Vec2{7.6, 14.5};
+    middle.health = 55;
+    middle.maxHealth = kZombieMaxHealth;
+    sweep.zombies.push_back(middle);
+    Input sweepInput;
+    sweepInput.dash = true;
+    sweepInput.dashDirection = Vec2{1.0, 0.0};
+    updateGame(sweep, sweepInput, 0.1);
+    if (!sweep.zombies[0].ragdoll) {
+        error = "the dash tunneled past a zombie at a large time step";
+        return false;
+    }
+
+    // The active dash grants invulnerability, then the same zombie can hit.
+    Game dodge = createGame();
+    dodge.vehicles.clear();
+    dodge.zombies.clear();
+    dodge.player.position = Vec2{6.5, 14.5};
+    dodge.player.yawDegrees = 0.0;
+    Zombie attacker;
+    attacker.spawn = attacker.position = Vec2{5.7, 14.5};
+    attacker.health = kZombieMaxHealth;
+    attacker.maxHealth = kZombieMaxHealth;
+    attacker.attackTimer = 0.0;
+    dodge.zombies.push_back(attacker);
+    if (!startDash(dodge, Vec2{1.0, 0.0})) {
+        error = "the dodge test could not start a dash";
+        return false;
+    }
+    const int healthBefore = dodge.player.health;
+    updateGame(dodge, Input{}, 0.01);
+    if (dodge.player.health != healthBefore) {
+        error = "a zombie hit the player during the dash invulnerability window";
+        return false;
+    }
+    dodge.player.dashTimer = 0.0;
+    dodge.player.dashCooldown = 1.0;
+    dodge.zombies[0].position = dodge.player.position - Vec2{0.8, 0.0};
+    dodge.zombies[0].attackTimer = 0.0;
+    dodge.zombies[0].stunTimer = 0.0;
+    updateGame(dodge, Input{}, 0.01);
+    if (dodge.player.health >= healthBefore) {
+        error = "the zombie could not attack once the dash ended";
+        return false;
+    }
+    return true;
+}
+
+bool selftestVehicleCombat(std::string& error) {
+    const auto setupImpact = [](Game& game, Vec2 carPosition, double speed,
+                                Vec2 zombiePosition) {
+        game.zombies.clear();
+        game.player.inVehicle = false;
+        game.player.vehicleIndex = -1;
+        Zombie zombie;
+        zombie.spawn = zombie.position = zombiePosition;
+        zombie.health = zombie.maxHealth = kZombieMaxHealth;
+        zombie.attackTimer = 90.0;
+        game.zombies.push_back(zombie);
+        Vehicle& car = game.vehicles[0];
+        car.position = carPosition;
+        car.heading = 0.0;
+        car.speed = speed;
+        car.steer = 0.0;
+        game.player.inVehicle = true;
+        game.player.vehicleIndex = 0;
+        game.player.position = carPosition;
+    };
+
+    Game low = createGame();
+    setupImpact(low, Vec2{8.8, 8.5}, 2.0, Vec2{9.8, 8.5});
+    for (int frame = 0; frame < 30 && low.zombies[0].health == kZombieMaxHealth;
+         ++frame) {
+        updateGame(low, Input{}, 1.0 / 60.0);
+    }
+    if (low.zombies[0].health == kZombieMaxHealth) {
+        error = "a slow vehicle did not damage a zombie";
+        return false;
+    }
+    if (low.zombies[0].health == 0) {
+        error = "a slow vehicle killed a full-health zombie too easily";
+        return false;
+    }
+    if (lengthSquared(low.zombies[0].knockback) <= 0.0) {
+        error = "a vehicle impact did not knock the zombie back";
+        return false;
+    }
+    if (low.particles.empty()) {
+        error = "a vehicle impact did not spawn particles";
+        return false;
+    }
+    if (low.kills != 0) {
+        error = "a non-lethal vehicle hit counted as a kill";
+        return false;
+    }
+
+    Game high = createGame();
+    setupImpact(high, Vec2{8.8, 8.5}, kMaxVehicleSpeed, Vec2{11.6, 8.5});
+    bool sawImpactSound = false;
+    for (int frame = 0; frame < 90 && !high.zombies[0].ragdoll; ++frame) {
+        updateGame(high, Input{}, 1.0 / 60.0);
+        for (SoundEvent event : high.soundEvents) {
+            if (event == SoundEvent::Impact) {
+                sawImpactSound = true;
+            }
+        }
+    }
+    if (!high.zombies[0].ragdoll) {
+        error = "a fast vehicle impact did not kill the zombie";
+        return false;
+    }
+    if (!sawImpactSound) {
+        error = "a vehicle impact did not queue an audio event";
+        return false;
+    }
+    if (high.zombies[0].health != 0 || high.kills != 1 || high.score <= 0) {
+        error = "a vehicle kill did not damage, kill and score correctly";
+        return false;
+    }
+    if (!high.zombies[0].flattened) {
+        error = "a fast vehicle impact did not flatten the corpse";
+        return false;
+    }
+    if (high.particles.empty()) {
+        error = "a vehicle kill did not spawn blood or dust";
+        return false;
+    }
+
+    // Respawn clears the ragdoll and flattening state.
+    Zombie& corpse = high.zombies[0];
+    corpse.respawnTimer = 0.0;
+    high.vehicles[0].position = Vec2{2.5, 2.5};
+    high.player.position = high.vehicles[0].position;
+    updateGame(high, Input{}, 0.01);
+    if (!corpse.alive || corpse.ragdoll || corpse.flattened) {
+        error = "a respawned zombie kept its ragdoll state";
+        return false;
+    }
+    return true;
+}
+
 bool selftestScene(const TestAssets& assets, std::string& error) {
     Game game = createGame();
 
@@ -700,6 +932,47 @@ bool selftestScene(const TestAssets& assets, std::string& error) {
         error = "the overhead 3D map view has too few distinct colors";
         return false;
     }
+
+    // A killed zombie must render as a ragdoll instead of disappearing at once.
+    Game effects = createGame();
+    effects.zombies.clear();
+    effects.player.yawDegrees = 0.0;
+    Zombie victim;
+    victim.spawn = victim.position = Vec2{8.0, 14.5};
+    victim.health = victim.maxHealth = kZombieMaxHealth;
+    effects.zombies.push_back(victim);
+    Image aliveFrame(320, 180);
+    renderGameFrame(aliveFrame, effects, assets, false, true, true);
+    damageZombie(effects.zombies[0], kZombieMaxHealth, Vec2{1.0, 0.0}, true);
+    for (int frame = 0; frame < 8; ++frame) {
+        updateGame(effects, Input{}, 0.05);
+    }
+    Image ragdollFrame(320, 180);
+    renderGameFrame(ragdollFrame, effects, assets, false, true, true);
+    if (countDifferentPixels(aliveFrame, ragdollFrame) < 100) {
+        error = "a ragdoll corpse is not rendered";
+        return false;
+    }
+
+    // Camera shake and dash motion blur must change the rendered frame.
+    Game shakeGame = createGame();
+    shakeGame.shake = 1.0;
+    const Camera stillCamera =
+        firstPersonCamera(shakeGame, kDefaultFov, static_cast<double>(320) / 180.0);
+    Camera shakenCamera = stillCamera;
+    applyCameraShake(shakenCamera, shakeGame);
+    if (length(shakenCamera.eye - stillCamera.eye) < 1e-6) {
+        error = "camera shake does not move the camera";
+        return false;
+    }
+    Image sharp(64, 36);
+    sharp.fillVerticalGradient(makeColor(10, 20, 40), makeColor(220, 160, 60));
+    Image blurred = sharp;
+    applyRadialBlur(blurred, 0.4);
+    if (countDifferentPixels(sharp, blurred) < 10) {
+        error = "the dash radial blur does not change the frame";
+        return false;
+    }
     return true;
 }
 
@@ -745,7 +1018,7 @@ bool selftestPPM(std::string& error) {
 bool runSelftest(const Grid& map) {
     std::string error;
     int failures = 0;
-    std::printf("3D engine and vehicle selftest\n");
+    std::printf("3D engine, dash and vehicle-combat selftest\n");
 
     if (selftestMath(error)) {
         std::printf("  [ok] math: transforms, projection, view matrix, field of view\n");
@@ -790,6 +1063,18 @@ bool runSelftest(const Grid& map) {
         std::printf("  [ok] vehicles: wall and vehicle collision, reverse, speed cap\n");
     } else {
         std::printf("  [FAIL] vehicles: %s\n", error.c_str());
+        ++failures;
+    }
+    if (selftestDash(error)) {
+        std::printf("  [ok] dash: burst speed, cooldown, invulnerability, kills, score\n");
+    } else {
+        std::printf("  [FAIL] dash: %s\n", error.c_str());
+        ++failures;
+    }
+    if (selftestVehicleCombat(error)) {
+        std::printf("  [ok] vehicle combat: speed damage, knockback, ragdoll, score\n");
+    } else {
+        std::printf("  [FAIL] vehicle combat: %s\n", error.c_str());
         ++failures;
     }
 

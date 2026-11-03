@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -40,6 +41,24 @@ constexpr double kVehicleReverseAcceleration = 4.2;
 constexpr double kVehicleDrag = 1.9;
 constexpr double kVehicleMaxSteer = 0.62;
 constexpr double kVehicleWheelBase = 1.05;
+
+// Shift dash: a short, fixed-direction burst with a burst of speed, damage to
+// zombies it ploughs through, a brief invulnerability window and a cooldown.
+constexpr double kDashSpeed = 12.0;
+constexpr double kDashDuration = 0.24;
+constexpr double kDashCooldown = 1.6;
+constexpr int kDashDamage = 80;
+constexpr double kDashKnockback = 6.5;
+constexpr double kDashHitRadius = kPlayerRadius + kZombieRadius + 0.20;
+constexpr double kDashScoreBonus = 150;
+
+// Vehicle-vs-zombie combat.  Damage grows with the impact speed, and the
+// fastest hits flatten the corpse instead of merely throwing it.
+constexpr double kVehicleImpactMinSpeed = 1.0;
+constexpr double kVehicleImpactCooldown = 0.32;
+constexpr double kVehicleImpactFlattenSpeed = 4.2;
+constexpr double kRagdollSeconds = 3.4;
+constexpr std::size_t kMaxParticles = 240;
 
 inline constexpr Vec2 kSpawn{6.5, 14.5};
 inline constexpr double kSpawnYaw = 330.0;  // map degrees: 0 = east, 90 = south
@@ -80,12 +99,39 @@ Vec3 mapToWorld(Vec2 position, double z);
 Vec3 mapDirectionToWorld(double mapHeading);
 double mapYawToWorldYaw(double mapYaw);
 
+// Simulation events consumed by the interactive front end.  A terminal game
+// has no audio device, so these drive the terminal bell as audio feedback.
+enum class SoundEvent {
+    Dash,
+    Impact,
+    Kill,
+};
+
+// A world-space effect particle: map position plus height, velocity in metres
+// per second, and a short lifetime.  Blood uses gravity; dust drifts upward.
+struct Particle {
+    Vec2 position;
+    double height = 0.0;
+    Vec2 velocity;
+    double verticalSpeed = 0.0;
+    double life = 0.0;
+    double maxLife = 1.0;
+    double size = 0.06;
+    Color color;
+    bool glow = false;
+};
+
 struct Player {
     Vec2 position = kSpawn;
     double yawDegrees = kSpawnYaw;
     int health = kPlayerMaxHealth;
     bool inVehicle = false;
     int vehicleIndex = -1;
+    Vec2 dashDirection{1.0, 0.0};
+    double dashTimer = 0.0;
+    double dashCooldown = 0.0;
+    double dashTrailTimer = 0.0;
+    int dashId = 0;
 };
 
 struct Vehicle {
@@ -110,6 +156,14 @@ struct Zombie {
     double attackTimer = 0.0;
     double hitFlash = 0.0;
     double walkPhase = 0.0;
+    Vec2 knockback;
+    double stunTimer = 0.0;
+    double impactCooldown = 0.0;
+    double deathElapsed = 0.0;
+    double deathSpin = 0.0;
+    bool ragdoll = false;
+    bool flattened = false;
+    int lastDashId = -1;
 };
 
 struct Game {
@@ -124,6 +178,13 @@ struct Game {
     double shotCooldown = 0.0;
     double muzzleFlash = 0.0;
     double damageFlash = 0.0;
+    int score = 0;
+    int combo = 0;
+    double comboTimer = 0.0;
+    double shake = 0.0;
+    double elapsed = 0.0;
+    std::vector<Particle> particles;
+    std::vector<SoundEvent> soundEvents;
 };
 
 struct Input {
@@ -132,6 +193,8 @@ struct Input {
     double turn = 0.0;      // [-1, 1], Left/Right arrows
     bool shoot = false;
     bool enterExit = false;
+    bool dash = false;
+    Vec2 dashDirection;     // map space; zero means the current facing
 };
 
 Game createGame();
@@ -142,12 +205,19 @@ int nearbyVehicle(const Game& game, double maxDistance = 2.2);
 bool enterVehicle(Game& game, int vehicleIndex);
 bool exitVehicle(Game& game);
 int findShotTarget(const Game& game, Vec2 origin, Vec2 direction);
-bool damageZombie(Zombie& zombie, int damage);
+bool damageZombie(Zombie& zombie, int damage, Vec2 impulse = Vec2{},
+                  bool flattened = false);
+
+// Start a Shift dash if the player is on foot, alive and off cooldown.  A zero
+// direction dashes along the current facing.  Returns true when it started.
+bool startDash(Game& game, Vec2 direction = Vec2{});
+bool dashReady(const Game& game);
 
 // Cameras.  horizontalFov/aspect describe the output image.
 Camera firstPersonCamera(const Game& game, double horizontalFovDegrees, double aspect);
 Camera chaseCamera(const Game& game, double horizontalFovDegrees, double aspect);
 Camera overheadCamera(double aspect);
+void applyCameraShake(Camera& camera, const Game& game);
 
 // Procedural textures and static triangles for the map.
 struct WorldAssets {
@@ -160,6 +230,7 @@ struct WorldAssets {
     Mesh floorMesh;
     Mesh ceilingMesh;
     Mesh waterMesh;
+    Mesh particleMesh;
 
     void build(const Grid& map);
 };
@@ -175,6 +246,7 @@ struct ZombieAssets {
     Mesh rightEye;
     Mesh shadow;
     Mesh healthQuad;
+    Mesh bloodPool;
 
     ZombieAssets();
 };
@@ -198,5 +270,6 @@ void appendWorldGeometry(Scene& scene, const WorldAssets& assets, bool includeCe
 void appendVehicles(Scene& scene, const Game& game, const VehicleAssets& assets);
 void appendZombies(Scene& scene, const Game& game, const ZombieAssets& assets,
                    bool showHealthBars);
+void appendParticles(Scene& scene, const Game& game, const WorldAssets& assets);
 
 }  // namespace g3d
