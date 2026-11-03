@@ -26,9 +26,15 @@ jobs:
           ./game3d --render /tmp/first-person.ppm --width 320 --height 180 --minimap
           ./game3d --render /tmp/overhead.ppm --width 320 --height 180 --map
           ./game3d --render /tmp/driving.ppm --width 320 --height 180 --drive 0
+          ./game3d --render /tmp/dash.ppm --width 320 --height 180 --dash
+          ./game3d --render /tmp/impact.ppm --width 320 --height 180 --impact
           python3 tools/ppm_to_png.py /tmp/first-person.ppm /tmp/first-person.png
           python3 tools/ppm_to_png.py /tmp/overhead.ppm /tmp/overhead.png
           python3 tools/ppm_to_png.py /tmp/driving.ppm /tmp/driving.png
+          python3 tools/ppm_to_png.py /tmp/dash.ppm /tmp/dash.png
+          python3 tools/ppm_to_png.py /tmp/impact.ppm /tmp/impact.png
           test -s /tmp/first-person.png
           test -s /tmp/overhead.png
           test -s /tmp/driving.png
+          test -s /tmp/dash.png
+          test -s /tmp/impact.png

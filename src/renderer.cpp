@@ -502,6 +502,43 @@ void renderScene(Image& image, const Scene& scene) {
     }
 }
 
+void applyRadialBlur(Image& image, double strength) {
+    const double amount = clampd(strength, 0.0, 0.6);
+    if (amount <= 1e-4 || image.width() < 3 || image.height() < 3) {
+        return;
+    }
+    const Image source = image;
+    const double centerX = (image.width() - 1) * 0.5;
+    const double centerY = (image.height() - 1) * 0.5;
+    constexpr int taps = 5;
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            const double dx = static_cast<double>(x) - centerX;
+            const double dy = static_cast<double>(y) - centerY;
+            int red = 0;
+            int green = 0;
+            int blue = 0;
+            for (int tap = 0; tap < taps; ++tap) {
+                const double t = amount * static_cast<double>(tap) /
+                                 static_cast<double>(taps - 1);
+                int sampleX = static_cast<int>(std::lround(
+                    static_cast<double>(x) - dx * t));
+                int sampleY = static_cast<int>(std::lround(
+                    static_cast<double>(y) - dy * t));
+                sampleX = std::clamp(sampleX, 0, image.width() - 1);
+                sampleY = std::clamp(sampleY, 0, image.height() - 1);
+                const Color& sample = source.at(sampleX, sampleY);
+                red += sample.r;
+                green += sample.g;
+                blue += sample.b;
+            }
+            image.at(x, y) = makeColor((red + taps / 2) / taps,
+                                       (green + taps / 2) / taps,
+                                       (blue + taps / 2) / taps);
+        }
+    }
+}
+
 CameraBasis cameraBasis(const Camera& camera) {
     CameraBasis basis;
     basis.forward = normalized(camera.target - camera.eye);

@@ -70,6 +70,96 @@ double cellHeight(std::uint8_t material) {
     return material == 5 ? kFountainHeight : kWallHeight;
 }
 
+void addParticle(Game& game, Vec2 position, double height, Vec2 velocity,
+                 double verticalSpeed, double life, double size, Color color,
+                 bool glow) {
+    if (game.particles.size() >= kMaxParticles) {
+        return;
+    }
+    Particle particle;
+    particle.position = position;
+    particle.height = height;
+    particle.velocity = velocity;
+    particle.verticalSpeed = verticalSpeed;
+    particle.life = life;
+    particle.maxLife = life;
+    particle.size = size;
+    particle.color = color;
+    particle.glow = glow;
+    game.particles.push_back(particle);
+}
+
+void spawnBlood(Game& game, Vec2 position, Vec2 direction, int count) {
+    const double baseAngle = std::atan2(direction.y, direction.x);
+    for (int i = 0; i < count; ++i) {
+        const double a = noise01(i, 17, static_cast<int>(game.elapsed * 1000.0));
+        const double b = noise01(i, 29, static_cast<int>(game.elapsed * 1000.0) + 7);
+        const double angle = baseAngle + (a - 0.5) * 2.1;
+        const double speed = 0.7 + b * 2.8;
+        addParticle(game, position, 0.75 + a * 0.65,
+                    Vec2{std::cos(angle) * speed, std::sin(angle) * speed},
+                    0.4 + b * 2.4, 0.45 + b * 0.55, 0.035 + a * 0.045,
+                    mix(makeColor(128, 12, 12), makeColor(210, 46, 30), b), false);
+    }
+}
+
+void spawnDust(Game& game, Vec2 position, Vec2 direction, int count, bool trail) {
+    const double baseAngle = std::atan2(direction.y, direction.x);
+    for (int i = 0; i < count; ++i) {
+        const double a = noise01(i, 41, static_cast<int>(game.elapsed * 1000.0) + 3);
+        const double b = noise01(i, 53, static_cast<int>(game.elapsed * 1000.0) + 11);
+        const double angle = baseAngle + kPi + (a - 0.5) * 1.3;
+        const double speed = 0.35 + b * 1.2;
+        addParticle(game, position, 0.12 + a * 0.35,
+                    Vec2{std::cos(angle) * speed, std::sin(angle) * speed},
+                    0.25 + b * 0.75, 0.3 + b * 0.45, 0.045 + a * 0.05,
+                    trail ? mix(makeColor(255, 186, 74), makeColor(255, 238, 196), b)
+                          : mix(makeColor(104, 96, 84), makeColor(168, 154, 136), b),
+                    true);
+    }
+}
+
+void updateParticles(Game& game, double deltaSeconds) {
+    std::size_t writeIndex = 0;
+    for (std::size_t i = 0; i < game.particles.size(); ++i) {
+        Particle particle = game.particles[i];
+        particle.life -= deltaSeconds;
+        if (particle.life <= 0.0) {
+            continue;
+        }
+        if (particle.glow) {
+            particle.velocity = particle.velocity * std::exp(-2.4 * deltaSeconds);
+            particle.verticalSpeed += 0.9 * deltaSeconds;
+        } else {
+            particle.velocity = particle.velocity * std::exp(-1.6 * deltaSeconds);
+            particle.verticalSpeed -= 9.8 * deltaSeconds;
+            particle.height += particle.verticalSpeed * deltaSeconds;
+            if (particle.height < 0.02 && particle.verticalSpeed < 0.0) {
+                particle.height = 0.02;
+                particle.verticalSpeed *= -0.22;
+                particle.velocity = particle.velocity * 0.55;
+            }
+        }
+        particle.position += particle.velocity * deltaSeconds;
+        game.particles[writeIndex++] = particle;
+    }
+    game.particles.resize(writeIndex);
+}
+
+void awardKill(Game& game, bool dashKill) {
+    ++game.kills;
+    if (dashKill) {
+        game.combo = std::min(5, game.combo + 1);
+        game.comboTimer = 1.8;
+        game.score += static_cast<int>(kDashScoreBonus) * game.combo;
+    } else {
+        game.combo = 0;
+        game.comboTimer = 0.0;
+        game.score += 100;
+    }
+    game.soundEvents.push_back(SoundEvent::Kill);
+}
+
 double distanceToVehicle(const Vehicle& vehicle, Vec2 point) {
     const Vec2 forward = directionFromRadians(vehicle.heading);
     const Vec2 rear = vehicle.position - forward * 0.5;
@@ -81,6 +171,16 @@ double distanceToVehicle(const Vehicle& vehicle, Vec2 point) {
         t = clampd(dot(point - rear, axis) / axisLengthSquared, 0.0, 1.0);
     }
     return length(point - (rear + axis * t));
+}
+
+double distanceToSegment(Vec2 point, Vec2 from, Vec2 to) {
+    const Vec2 axis = to - from;
+    const double lengthSquaredAxis = lengthSquared(axis);
+    if (lengthSquaredAxis < 1e-12) {
+        return length(point - from);
+    }
+    const double t = clampd(dot(point - from, axis) / lengthSquaredAxis, 0.0, 1.0);
+    return length(point - (from + axis * t));
 }
 
 bool circleHitsVehicle(const Vehicle& vehicle, Vec2 point, double radius) {
@@ -227,6 +327,98 @@ void updateVehicle(Game& game, int index, double throttle, double steerInput,
                                          vehicle.speed * deltaSeconds / 0.27);
 }
 
+void applyVehicleImpacts(Game& game) {
+    for (const Vehicle& vehicle : game.vehicles) {
+        const double speedAbs = std::fabs(vehicle.speed);
+        if (speedAbs < kVehicleImpactMinSpeed) {
+            continue;
+        }
+        const Vec2 forward = directionFromRadians(vehicle.heading);
+        const Vec2 motion = forward * (vehicle.speed >= 0.0 ? 1.0 : -1.0);
+        for (Zombie& zombie : game.zombies) {
+            if (!zombie.alive || zombie.impactCooldown > 0.0) {
+                continue;
+            }
+            if (distanceToVehicle(vehicle, zombie.position) > 0.62) {
+                continue;
+            }
+            const int damage = 10 + static_cast<int>(std::lround(
+                                       (speedAbs - kVehicleImpactMinSpeed) * 26.0));
+            Vec2 impulseDirection = normalized(
+                motion * 0.75 + normalized(zombie.position - vehicle.position) * 0.25);
+            if (lengthSquared(impulseDirection) < 1e-9) {
+                impulseDirection = motion;
+            }
+            const Vec2 impulse =
+                impulseDirection * (2.2 + speedAbs * 0.85);
+            const bool killed = damageZombie(
+                zombie, damage, impulse, speedAbs >= kVehicleImpactFlattenSpeed);
+            zombie.stunTimer = std::max(zombie.stunTimer, 0.55 + speedAbs * 0.08);
+            zombie.impactCooldown = kVehicleImpactCooldown;
+            spawnBlood(game, zombie.position, impulseDirection,
+                       10 + static_cast<int>(speedAbs * 1.5));
+            spawnDust(game, zombie.position, impulseDirection, 4, false);
+            game.shake = std::max(game.shake, 0.35 + speedAbs * 0.06);
+            game.soundEvents.push_back(SoundEvent::Impact);
+            if (killed) {
+                awardKill(game, false);
+            }
+        }
+    }
+}
+
+void updatePlayerDash(Game& game, double deltaSeconds) {
+    Player& player = game.player;
+    if (player.dashTimer <= 0.0) {
+        return;
+    }
+    player.dashTimer = std::max(0.0, player.dashTimer - deltaSeconds);
+    const double step = kDashSpeed * deltaSeconds;
+    const Vec2 before = player.position;
+    const MoveResult moved = movePlayer(game, player.dashDirection * step);
+    const double travelled = length(player.position - before);
+    if ((moved.blockedX || moved.blockedY) && travelled < step * 0.5) {
+        player.dashTimer = 0.0;
+        game.shake = std::max(game.shake, 0.5);
+        spawnDust(game, player.position, player.dashDirection, 5, false);
+    }
+
+    player.dashTrailTimer -= deltaSeconds;
+    if (player.dashTrailTimer <= 0.0) {
+        player.dashTrailTimer = 0.035;
+        spawnDust(game, player.position, player.dashDirection, 2, true);
+    }
+
+    const Vec2 after = player.position;
+    for (Zombie& zombie : game.zombies) {
+        if (!zombie.alive || zombie.lastDashId == player.dashId) {
+            continue;
+        }
+        if (distanceToSegment(zombie.position, before, after) > kDashHitRadius) {
+            continue;
+        }
+        zombie.lastDashId = player.dashId;
+        const bool killed =
+            damageZombie(zombie, kDashDamage, player.dashDirection * kDashKnockback,
+                         false);
+        zombie.stunTimer = std::max(zombie.stunTimer, 0.7);
+        spawnBlood(game, zombie.position, player.dashDirection, killed ? 16 : 10);
+        spawnDust(game, zombie.position, player.dashDirection, 3, false);
+        game.shake = std::max(game.shake, 0.6);
+        game.soundEvents.push_back(SoundEvent::Impact);
+        if (killed) {
+            awardKill(game, true);
+            player.dashCooldown = std::max(0.0, player.dashCooldown - 0.22);
+        }
+    }
+
+    game.shake = std::max(
+        game.shake, 0.22 * (player.dashTimer / kDashDuration));
+    if (player.dashTimer <= 0.0) {
+        spawnDust(game, player.position, player.dashDirection, 4, false);
+    }
+}
+
 std::vector<Vehicle> createVehicles() {
     std::vector<Vehicle> vehicles;
     vehicles.reserve(kVehicleSpawns.size());
@@ -265,7 +457,12 @@ void tryMoveZombie(const Game& game, Zombie& zombie, Vec2 delta) {
             return false;
         }
         for (const Vehicle& vehicle : game.vehicles) {
-            if (distanceToVehicle(vehicle, candidate) < 0.62) {
+            const double current = distanceToVehicle(vehicle, zombie.position);
+            const double next = distanceToVehicle(vehicle, candidate);
+            // A zombie that is already overlapping a hull (for example after a
+            // vehicle hit) must be able to move away; only block motion that
+            // pushes it deeper into the car.
+            if (next < 0.62 && next < current - 1e-9) {
                 return false;
             }
         }
@@ -288,6 +485,17 @@ int updateZombies(Game& game, double deltaSeconds) {
         zombie.hitFlash = std::max(0.0, zombie.hitFlash - deltaSeconds);
         if (!zombie.alive) {
             zombie.respawnTimer -= deltaSeconds;
+            if (zombie.ragdoll) {
+                zombie.deathElapsed += deltaSeconds;
+                if (lengthSquared(zombie.knockback) > 1e-8) {
+                    tryMoveZombie(game, zombie, zombie.knockback * deltaSeconds);
+                    zombie.knockback =
+                        zombie.knockback * std::exp(-3.0 * deltaSeconds);
+                    if (length(zombie.knockback) < 0.05) {
+                        zombie.knockback = Vec2{};
+                    }
+                }
+            }
             if (zombie.respawnTimer <= 0.0) {
                 const Vec2 toPlayer = zombie.spawn - target;
                 if (length(toPlayer) > 2.5 &&
@@ -295,6 +503,13 @@ int updateZombies(Game& game, double deltaSeconds) {
                     zombie.position = zombie.spawn;
                     zombie.health = zombie.maxHealth;
                     zombie.alive = true;
+                    zombie.ragdoll = false;
+                    zombie.flattened = false;
+                    zombie.deathElapsed = 0.0;
+                    zombie.knockback = Vec2{};
+                    zombie.stunTimer = 0.0;
+                    zombie.impactCooldown = 0.0;
+                    zombie.lastDashId = -1;
                     zombie.attackTimer = 0.5;
                     zombie.walkPhase = 0.0;
                 }
@@ -303,6 +518,19 @@ int updateZombies(Game& game, double deltaSeconds) {
         }
 
         zombie.attackTimer = std::max(0.0, zombie.attackTimer - deltaSeconds);
+        zombie.impactCooldown = std::max(0.0, zombie.impactCooldown - deltaSeconds);
+        zombie.stunTimer = std::max(0.0, zombie.stunTimer - deltaSeconds);
+        if (lengthSquared(zombie.knockback) > 1e-8) {
+            tryMoveZombie(game, zombie, zombie.knockback * deltaSeconds);
+            zombie.knockback = zombie.knockback * std::exp(-5.0 * deltaSeconds);
+            if (length(zombie.knockback) < 0.05) {
+                zombie.knockback = Vec2{};
+            }
+        }
+        if (zombie.stunTimer > 0.0) {
+            continue;
+        }
+
         const Vec2 relative{target.x - zombie.position.x, target.y - zombie.position.y};
         const double distance = length(relative);
         if (distance > 1e-9) {
@@ -318,6 +546,7 @@ int updateZombies(Game& game, double deltaSeconds) {
                                    relative.y / distance * step});
                 zombie.walkPhase += deltaSeconds * 7.0;
             } else if (!game.playerDead && !game.player.inVehicle &&
+                       game.player.dashTimer <= 0.0 &&
                        zombie.attackTimer <= 0.0) {
                 playerDamage += kZombieAttackDamage;
                 zombie.attackTimer = kZombieAttackCooldown;
@@ -735,6 +964,11 @@ void resetGame(Game& game) {
     game.player.health = kPlayerMaxHealth;
     game.player.inVehicle = false;
     game.player.vehicleIndex = -1;
+    game.player.dashDirection = Vec2{1.0, 0.0};
+    game.player.dashTimer = 0.0;
+    game.player.dashCooldown = 0.0;
+    game.player.dashTrailTimer = 0.0;
+    game.player.dashId = 0;
     game.vehicles = createVehicles();
     game.zombies = createZombies(game.startPosition);
     game.kills = 0;
@@ -742,6 +976,41 @@ void resetGame(Game& game) {
     game.shotCooldown = 0.0;
     game.muzzleFlash = 0.0;
     game.damageFlash = 0.0;
+    game.score = 0;
+    game.combo = 0;
+    game.comboTimer = 0.0;
+    game.shake = 0.0;
+    game.elapsed = 0.0;
+    game.particles.clear();
+    game.soundEvents.clear();
+}
+
+bool startDash(Game& game, Vec2 direction) {
+    Player& player = game.player;
+    if (game.playerDead || player.inVehicle || player.dashTimer > 0.0 ||
+        player.dashCooldown > 0.0) {
+        return false;
+    }
+    if (lengthSquared(direction) < 1e-9) {
+        direction = directionFromDegrees(player.yawDegrees);
+    }
+    player.dashDirection = normalized(direction);
+    if (lengthSquared(player.dashDirection) < 1e-9) {
+        return false;
+    }
+    player.dashTimer = kDashDuration;
+    player.dashCooldown = kDashCooldown;
+    player.dashTrailTimer = 0.0;
+    ++player.dashId;
+    game.shake = std::max(game.shake, 0.55);
+    spawnDust(game, player.position, player.dashDirection, 7, true);
+    game.soundEvents.push_back(SoundEvent::Dash);
+    return true;
+}
+
+bool dashReady(const Game& game) {
+    return !game.playerDead && !game.player.inVehicle &&
+           game.player.dashTimer <= 0.0 && game.player.dashCooldown <= 0.0;
 }
 
 int nearbyVehicle(const Game& game, double maxDistance) {
@@ -851,14 +1120,22 @@ int findShotTarget(const Game& game, Vec2 origin, Vec2 direction) {
     return best;
 }
 
-bool damageZombie(Zombie& zombie, int damage) {
+bool damageZombie(Zombie& zombie, int damage, Vec2 impulse, bool flattened) {
     if (!zombie.alive) {
         return false;
     }
     zombie.health = std::max(0, zombie.health - damage);
     zombie.hitFlash = 0.16;
+    if (lengthSquared(impulse) > 1e-9) {
+        zombie.knockback += impulse;
+        zombie.stunTimer = std::max(zombie.stunTimer, 0.45);
+    }
     if (zombie.health == 0) {
         zombie.alive = false;
+        zombie.ragdoll = true;
+        zombie.flattened = flattened;
+        zombie.deathElapsed = 0.0;
+        zombie.deathSpin = impulse.x >= 0.0 ? 1.0 : -1.0;
         zombie.respawnTimer = kZombieRespawnSeconds;
         zombie.attackTimer = 0.0;
         return true;
@@ -870,11 +1147,23 @@ void updateGame(Game& game, const Input& input, double deltaSeconds) {
     if (deltaSeconds <= 0.0) {
         return;
     }
+    game.soundEvents.clear();
+    game.elapsed += deltaSeconds;
     game.shotCooldown = std::max(0.0, game.shotCooldown - deltaSeconds);
     game.muzzleFlash = std::max(0.0, game.muzzleFlash - deltaSeconds * 6.0);
     game.damageFlash = std::max(0.0, game.damageFlash - deltaSeconds * 2.5);
+    game.shake = std::max(0.0, game.shake - deltaSeconds * 2.1);
+    game.player.dashCooldown =
+        std::max(0.0, game.player.dashCooldown - deltaSeconds);
+    if (game.comboTimer > 0.0) {
+        game.comboTimer -= deltaSeconds;
+        if (game.comboTimer <= 0.0) {
+            game.comboTimer = 0.0;
+            game.combo = 0;
+        }
+    }
 
-    if (input.enterExit) {
+    if (input.enterExit && game.player.dashTimer <= 0.0) {
         if (game.player.inVehicle) {
             exitVehicle(game);
         } else {
@@ -892,28 +1181,37 @@ void updateGame(Game& game, const Input& input, double deltaSeconds) {
             game.player.position =
                 game.vehicles[static_cast<std::size_t>(game.player.vehicleIndex)].position;
         } else {
-            const Vec2 forward = directionFromDegrees(game.player.yawDegrees);
-            const Vec2 right = perpendicular(forward);
-            const Vec2 delta =
-                forward * (clampd(input.forward, -1.0, 1.0) * 2.6 * deltaSeconds) +
-                right * (clampd(input.strafe, -1.0, 1.0) * 2.1 * deltaSeconds);
-            if (lengthSquared(delta) > 1e-12) {
-                movePlayer(game, delta);
+            if (input.dash) {
+                startDash(game, input.dashDirection);
             }
-            game.player.yawDegrees =
-                normalizeDegrees(game.player.yawDegrees +
-                                 clampd(input.turn, -1.0, 1.0) * 110.0 * deltaSeconds);
+            if (game.player.dashTimer > 0.0) {
+                updatePlayerDash(game, deltaSeconds);
+            } else {
+                const Vec2 forward = directionFromDegrees(game.player.yawDegrees);
+                const Vec2 right = perpendicular(forward);
+                const Vec2 delta =
+                    forward * (clampd(input.forward, -1.0, 1.0) * 2.6 * deltaSeconds) +
+                    right * (clampd(input.strafe, -1.0, 1.0) * 2.1 * deltaSeconds);
+                if (lengthSquared(delta) > 1e-12) {
+                    movePlayer(game, delta);
+                }
+                game.player.yawDegrees =
+                    normalizeDegrees(game.player.yawDegrees +
+                                     clampd(input.turn, -1.0, 1.0) * 110.0 * deltaSeconds);
 
-            if (input.shoot && game.shotCooldown <= 0.0) {
-                game.shotCooldown = kShotCooldown;
-                game.muzzleFlash = 0.09;
-                const int target = findShotTarget(
-                    game, game.player.position,
-                    directionFromDegrees(game.player.yawDegrees));
-                if (target >= 0 &&
-                    damageZombie(game.zombies[static_cast<std::size_t>(target)],
-                                 kShotDamage)) {
-                    ++game.kills;
+                if (input.shoot && game.shotCooldown <= 0.0) {
+                    game.shotCooldown = kShotCooldown;
+                    game.muzzleFlash = 0.09;
+                    const Vec2 shotDirection =
+                        directionFromDegrees(game.player.yawDegrees);
+                    const int target =
+                        findShotTarget(game, game.player.position, shotDirection);
+                    if (target >= 0 &&
+                        damageZombie(
+                            game.zombies[static_cast<std::size_t>(target)],
+                            kShotDamage, shotDirection * 2.2)) {
+                        awardKill(game, false);
+                    }
                 }
             }
         }
@@ -922,7 +1220,9 @@ void updateGame(Game& game, const Input& input, double deltaSeconds) {
             game.vehicles[static_cast<std::size_t>(game.player.vehicleIndex)].position;
     }
 
+    applyVehicleImpacts(game);
     const int incomingDamage = updateZombies(game, deltaSeconds);
+    updateParticles(game, deltaSeconds);
     if (incomingDamage > 0 && !game.playerDead) {
         game.player.health = std::max(0, game.player.health - incomingDamage);
         game.damageFlash = 0.6;
@@ -979,6 +1279,21 @@ Camera overheadCamera(double aspect) {
     return camera;
 }
 
+void applyCameraShake(Camera& camera, const Game& game) {
+    if (game.shake <= 1e-6) {
+        return;
+    }
+    const CameraBasis basis = cameraBasis(camera);
+    const double strength = game.shake * 0.11;
+    const double t = game.elapsed * 43.0;
+    const Vec3 offset =
+        basis.right * (std::sin(t * 1.7) * strength) +
+        basis.up * (std::cos(t * 2.3) * strength * 0.72);
+    camera.eye += offset;
+    camera.target += offset * 0.35 +
+                     basis.right * (std::sin(t * 3.1) * strength * 0.25);
+}
+
 Color mapMaterialColor(std::uint8_t material) {
     switch (material) {
         case 1:
@@ -1009,6 +1324,10 @@ void WorldAssets::build(const Grid& map) {
     floorMesh = Mesh{};
     ceilingMesh = Mesh{};
     waterMesh = Mesh{};
+    particleMesh = Mesh{};
+    particleMesh.addQuad(Vec3{-0.5, -0.5, 0.0}, Vec3{1.0, 0.0, 0.0},
+                         Vec3{0.0, 1.0, 0.0}, 1.0, 1.0, Vec2{0.0, 0.0},
+                         Vec2{1.0, 1.0});
 
     floorMesh.addQuad(Vec3{0.0, 0.0, 0.0}, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0},
                       static_cast<double>(kMapWidth), static_cast<double>(kMapHeight),
@@ -1087,6 +1406,7 @@ ZombieAssets::ZombieAssets() {
     shadow = makeDiscMesh(14);
     healthQuad.addQuad(Vec3{-0.5, -0.5, 0.0}, Vec3{1.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0},
                        1.0, 1.0, Vec2{0.0, 0.0}, Vec2{1.0, 1.0});
+    bloodPool = makeDiscMesh(18);
 }
 
 VehicleAssets::VehicleAssets() {
@@ -1174,14 +1494,66 @@ void appendZombies(Scene& scene, const Game& game, const ZombieAssets& assets,
     billboard.m[2][2] = towardCamera.z;
 
     for (const Zombie& zombie : game.zombies) {
+        const double flash = std::min(1.0, zombie.hitFlash / 0.16) * 0.65;
         if (!zombie.alive) {
+            if (!zombie.ragdoll || zombie.deathElapsed >= kRagdollSeconds) {
+                continue;
+            }
+            const double fall = smoothstep(0.0, 0.6, zombie.deathElapsed);
+            const double settle = smoothstep(0.6, 1.6, zombie.deathElapsed);
+            const double fade =
+                clampd((kRagdollSeconds - zombie.deathElapsed) / 0.45, 0.0, 1.0);
+            Mat4 corpse =
+                translationMatrix(mapToWorld(zombie.position, 0.05 + 0.05 * fall)) *
+                rotationZMatrix(-zombie.heading + zombie.deathSpin * 0.24 * fall);
+            if (zombie.flattened) {
+                corpse = corpse * scaleMatrix(Vec3{1.30, 1.30, 0.34});
+            } else {
+                corpse = corpse * rotationYMatrix(-1.45 * fall);
+            }
+            corpse = corpse * scaleMatrix(Vec3{fade, fade, fade});
+
+            addPart(scene, assets.bloodPool,
+                    translationMatrix(mapToWorld(zombie.position, 0.012)) *
+                        rotationZMatrix(-zombie.heading) *
+                        scaleMatrix(Vec3{0.55 + 0.35 * settle,
+                                         0.40 + 0.25 * settle, 1.0}),
+                    mix(makeColor(80, 8, 8), makeColor(138, 22, 14), settle), true);
+            addPart(scene, assets.shadow,
+                    translationMatrix(mapToWorld(zombie.position, 0.018)) *
+                        scaleMatrix(Vec3{0.50, 0.34, 1.0}),
+                    makeColor(12, 14, 18), true);
+            const double splay = zombie.flattened ? 1.35 : 0.95;
+            addPart(scene, assets.leftLeg,
+                    corpse * translationMatrix(Vec3{0.0, 0.10, 0.78}) *
+                        rotationYMatrix(-splay),
+                    zombiePants(flash));
+            addPart(scene, assets.rightLeg,
+                    corpse * translationMatrix(Vec3{0.0, -0.10, 0.78}) *
+                        rotationYMatrix(splay),
+                    zombiePants(flash));
+            addPart(scene, assets.torso, corpse, zombieCloth(flash));
+            addPart(scene, assets.leftArm,
+                    corpse * translationMatrix(Vec3{0.0, 0.23, 1.28}) *
+                        rotationYMatrix(-1.9 - splay * 0.2),
+                    zombieSkin(flash));
+            addPart(scene, assets.rightArm,
+                    corpse * translationMatrix(Vec3{0.0, -0.23, 1.28}) *
+                        rotationYMatrix(-1.9 + splay * 0.2),
+                    zombieSkin(flash));
+            addPart(scene, assets.head, corpse, zombieSkin(flash));
+            addPart(scene, assets.leftEye,
+                    corpse * translationMatrix(Vec3{0.112, 0.055, 1.51}),
+                    makeColor(238, 66, 46), true);
+            addPart(scene, assets.rightEye,
+                    corpse * translationMatrix(Vec3{0.112, -0.055, 1.51}),
+                    makeColor(238, 66, 46), true);
             continue;
         }
+
         const Vec3 basePosition = mapToWorld(zombie.position, 0.0);
         const Mat4 base =
             translationMatrix(basePosition) * rotationZMatrix(-zombie.heading);
-        const double flash =
-            std::min(1.0, zombie.hitFlash / 0.16) * 0.65;
         const double swing = std::sin(zombie.walkPhase) * 0.55;
         const double bob = std::fabs(std::sin(zombie.walkPhase)) * 0.025;
 
@@ -1238,6 +1610,37 @@ void appendZombies(Scene& scene, const Game& game, const ZombieAssets& assets,
                 translationMatrix(fillCenter) * billboard *
                     scaleMatrix(Vec3{std::max(0.02, fillWidth), 0.05, 1.0}),
                 fillColor, true);
+    }
+}
+
+void appendParticles(Scene& scene, const Game& game, const WorldAssets& assets) {
+    if (game.particles.empty()) {
+        return;
+    }
+    const CameraBasis basis = cameraBasis(scene.camera);
+    const Vec3 towardCamera = -basis.forward;
+    Mat4 billboard = identityMatrix();
+    billboard.m[0][0] = basis.right.x;
+    billboard.m[1][0] = basis.right.y;
+    billboard.m[2][0] = basis.right.z;
+    billboard.m[0][1] = basis.up.x;
+    billboard.m[1][1] = basis.up.y;
+    billboard.m[2][1] = basis.up.z;
+    billboard.m[0][2] = towardCamera.x;
+    billboard.m[1][2] = towardCamera.y;
+    billboard.m[2][2] = towardCamera.z;
+
+    for (const Particle& particle : game.particles) {
+        const double fade =
+            clampd(particle.life / std::max(1e-6, particle.maxLife), 0.0, 1.0);
+        const double age = 1.0 - fade;
+        const double size =
+            particle.size *
+            (particle.glow ? (0.7 + age * 1.7) : (1.0 - age * 0.35));
+        addPart(scene, assets.particleMesh,
+                translationMatrix(mapToWorld(particle.position, particle.height)) *
+                    billboard * scaleMatrix(Vec3{size, size, 1.0}),
+                shade(particle.color, 0.45 + 0.55 * fade), true);
     }
 }
 

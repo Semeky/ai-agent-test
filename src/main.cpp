@@ -30,6 +30,9 @@ struct Options {
     bool selftest = false;
     bool mapView = false;
     bool minimap = false;
+    bool dashDemo = false;
+    bool impactDemo = false;
+    bool noSound = false;
     Vec2 position = kSpawn;
     double yawDegrees = kSpawnYaw;
     double fovDegrees = kDefaultFov;
@@ -52,8 +55,11 @@ struct FrameOptions {
     bool mapView = false;
     bool minimap = false;
     bool firing = false;
+    bool impactDemo = false;
     double fovDegrees = kDefaultFov;
 };
+
+Camera impactCamera(const Game& game, double horizontalFovDegrees, double aspect);
 
 void printUsage(std::FILE* stream) {
     std::fprintf(
@@ -70,6 +76,9 @@ void printUsage(std::FILE* stream) {
         "  --map                overhead 3D map view\n"
         "  --minimap            start with the minimap enabled\n"
         "  --drive <n>          start inside vehicle n (0-based)\n"
+        "  --dash               render the Shift-dash demo state\n"
+        "  --impact             render the vehicle-impact demo state\n"
+        "  --no-sound           disable terminal-bell audio feedback\n"
         "  --width <px>         render width (default 960)\n"
         "  --height <px>        render height (default 540)\n"
         "  --fov <deg>          horizontal field of view (default 75)\n"
@@ -82,6 +91,8 @@ void printUsage(std::FILE* stream) {
         "  W/S or Up/Down  move / accelerate / brake\n"
         "  A/D             strafe on foot / steer a vehicle\n"
         "  Left/Right      turn on foot / steer a vehicle\n"
+        "  Shift+WASD      dash in that direction (terminals cannot report a\n"
+        "                  bare Shift press), or press F to dash forward\n"
         "  E               enter or exit a vehicle\n"
         "  Space           fire on foot\n"
         "  Tab             overhead 3D map view\n"
@@ -148,6 +159,12 @@ bool parseOptions(int argc, char** argv, Options& options, std::string& error) {
             options.mapView = true;
         } else if (argument == "--minimap") {
             options.minimap = true;
+        } else if (argument == "--dash") {
+            options.dashDemo = true;
+        } else if (argument == "--impact") {
+            options.impactDemo = true;
+        } else if (argument == "--no-sound") {
+            options.noSound = true;
         } else if (argument == "--render") {
             const char* value = nextValue("--render");
             if (value == nullptr) {
@@ -227,6 +244,10 @@ bool parseOptions(int argc, char** argv, Options& options, std::string& error) {
         error = "--drive must be a non-negative vehicle index";
         return false;
     }
+    if (options.dashDemo && options.impactDemo) {
+        error = "--dash and --impact are mutually exclusive";
+        return false;
+    }
     return true;
 }
 
@@ -237,18 +258,28 @@ void renderGameFrame(Image& image, const Game& game, const RenderAssets& assets,
         static_cast<double>(image.width()) / static_cast<double>(image.height());
     if (options.mapView) {
         scene.camera = overheadCamera(aspect);
+    } else if (options.impactDemo) {
+        scene.camera = impactCamera(game, options.fovDegrees, aspect);
     } else if (game.player.inVehicle) {
         scene.camera = chaseCamera(game, options.fovDegrees, aspect);
     } else {
         scene.camera = firstPersonCamera(game, options.fovDegrees, aspect);
     }
+    applyCameraShake(scene.camera, game);
     appendWorldGeometry(scene, assets.world, !options.mapView);
     appendVehicles(scene, game, assets.vehicles);
     appendZombies(scene, game, assets.zombies, !options.mapView);
+    appendParticles(scene, game, assets.world);
     renderScene(image, scene);
 
     if (options.mapView) {
         return;
+    }
+    if (game.player.dashTimer > 0.0 && !game.player.inVehicle) {
+        const double intensity =
+            clampd(game.player.dashTimer / kDashDuration, 0.0, 1.0);
+        applyRadialBlur(image, 0.10 + 0.05 * intensity);
+        drawDashEffects(image, game);
     }
     if (game.damageFlash > 0.0) {
         image.fillRect(0, 0, image.width(), image.height(), makeColor(150, 16, 16),
@@ -272,6 +303,87 @@ bool startInVehicle(Game& game, int index) {
     }
     game.player.position = game.vehicles[static_cast<std::size_t>(index)].position;
     return enterVehicle(game, index);
+}
+
+// Deterministic captures for the screenshots and for manual inspection.  Both
+// scenarios run the real update loop rather than posing a fake frame.
+void setupDashDemo(Game& game) {
+    game.player.position = Vec2{6.5, 14.5};
+    game.player.yawDegrees = 0.0;
+    game.player.health = kPlayerMaxHealth;
+    game.player.inVehicle = false;
+    game.player.vehicleIndex = -1;
+    game.zombies.clear();
+    Zombie target;
+    target.spawn = target.position = Vec2{11.5, 14.5};
+    target.health = 55;
+    target.maxHealth = kZombieMaxHealth;
+    target.attackTimer = 1.0;
+    game.zombies.push_back(target);
+    game.particles.clear();
+    game.soundEvents.clear();
+    game.shake = 0.0;
+
+    Input dashInput;
+    dashInput.dash = true;
+    dashInput.dashDirection = Vec2{1.0, 0.0};
+    updateGame(game, dashInput, 1.0 / 60.0);
+    for (int frame = 0; frame < 5; ++frame) {
+        updateGame(game, Input{}, 1.0 / 60.0);
+    }
+}
+
+void setupImpactDemo(Game& game) {
+    game.player.inVehicle = false;
+    game.player.vehicleIndex = -1;
+    game.zombies.clear();
+    Zombie target;
+    target.spawn = target.position = Vec2{11.6, 8.5};
+    target.health = kZombieMaxHealth;
+    target.maxHealth = kZombieMaxHealth;
+    target.attackTimer = 90.0;
+    game.zombies.push_back(target);
+    game.particles.clear();
+    game.soundEvents.clear();
+    game.shake = 0.0;
+
+    Vehicle& car = game.vehicles[0];
+    car.position = Vec2{8.8, 8.5};
+    car.heading = 0.0;
+    car.speed = kMaxVehicleSpeed;
+    car.steer = 0.0;
+    game.player.inVehicle = true;
+    game.player.vehicleIndex = 0;
+    game.player.position = car.position;
+
+    Input drive;
+    drive.forward = 1.0;
+    for (int frame = 0; frame < 90 && !game.zombies[0].ragdoll; ++frame) {
+        updateGame(game, drive, 1.0 / 60.0);
+    }
+    car.speed = 0.0;
+    for (int frame = 0; frame < 14; ++frame) {
+        updateGame(game, Input{}, 1.0 / 60.0);
+    }
+    game.shake = std::max(game.shake, 0.45);
+}
+
+// A three-quarter camera for the impact capture: the normal chase camera sits
+// behind the car roof, which hides a corpse lying just in front of the bumper.
+Camera impactCamera(const Game& game, double horizontalFovDegrees, double aspect) {
+    Vec2 focus = game.player.position;
+    for (const Zombie& zombie : game.zombies) {
+        if (zombie.ragdoll) {
+            focus = zombie.position;
+            break;
+        }
+    }
+    Camera camera;
+    camera.eye = mapToWorld(focus + Vec2{0.0, 1.9}, 2.85);
+    camera.target = mapToWorld(focus + Vec2{-0.9, -0.1}, 0.45);
+    camera.up = Vec3{0.0, 0.0, 1.0};
+    camera.fovYDegrees = verticalFovFromHorizontal(horizontalFovDegrees, aspect);
+    return camera;
 }
 
 #if defined(GAME3D_POSIX)
@@ -456,7 +568,12 @@ int runInteractive(const Options& options, const Grid& map, const RenderAssets& 
     game.startPosition = options.position;
     game.startYawDegrees = options.yawDegrees;
     resetGame(game);
-    if (options.driveVehicle >= 0 && !startInVehicle(game, options.driveVehicle)) {
+    if (options.dashDemo) {
+        setupDashDemo(game);
+    } else if (options.impactDemo) {
+        setupImpactDemo(game);
+    } else if (options.driveVehicle >= 0 &&
+               !startInVehicle(game, options.driveVehicle)) {
         terminal.restore();
         std::fprintf(stderr, "error: vehicle %d cannot be entered\n", options.driveVehicle);
         return 1;
@@ -471,12 +588,18 @@ int runInteractive(const Options& options, const Grid& map, const RenderAssets& 
     double turnIntent = 0.0;
     bool shootRequested = false;
     bool enterRequested = false;
+    bool dashRequested = false;
+    Vec2 dashDirection;
     double displayedFps = 0.0;
     auto previousFrame = std::chrono::steady_clock::now();
 
     const auto restart = [&]() {
         resetGame(game);
-        if (options.driveVehicle >= 0) {
+        if (options.dashDemo) {
+            setupDashDemo(game);
+        } else if (options.impactDemo) {
+            setupImpactDemo(game);
+        } else if (options.driveVehicle >= 0) {
             startInVehicle(game, options.driveVehicle);
         }
         forwardIntent = 0.0;
@@ -484,6 +607,8 @@ int runInteractive(const Options& options, const Grid& map, const RenderAssets& 
         turnIntent = 0.0;
         shootRequested = false;
         enterRequested = false;
+        dashRequested = false;
+        dashDirection = Vec2{};
     };
 
     while (running) {
@@ -494,28 +619,51 @@ int runInteractive(const Options& options, const Grid& map, const RenderAssets& 
             }
             switch (key) {
                 case 'w':
-                case 'W':
                 case kKeyUp:
                     forwardIntent = 0.16;
                     break;
+                case 'W':
+                    forwardIntent = 0.16;
+                    dashRequested = true;
+                    dashDirection = directionFromDegrees(game.player.yawDegrees);
+                    break;
                 case 's':
-                case 'S':
                 case kKeyDown:
                     forwardIntent = -0.16;
                     break;
+                case 'S':
+                    forwardIntent = -0.16;
+                    dashRequested = true;
+                    dashDirection = -directionFromDegrees(game.player.yawDegrees);
+                    break;
                 case 'a':
-                case 'A':
                     strafeIntent = -0.13;
                     break;
+                case 'A':
+                    strafeIntent = -0.13;
+                    dashRequested = true;
+                    dashDirection =
+                        -perpendicular(directionFromDegrees(game.player.yawDegrees));
+                    break;
                 case 'd':
+                    strafeIntent = 0.13;
+                    break;
                 case 'D':
                     strafeIntent = 0.13;
+                    dashRequested = true;
+                    dashDirection =
+                        perpendicular(directionFromDegrees(game.player.yawDegrees));
                     break;
                 case kKeyLeft:
                     turnIntent = -0.14;
                     break;
                 case kKeyRight:
                     turnIntent = 0.14;
+                    break;
+                case 'f':
+                case 'F':
+                    dashRequested = true;
+                    dashDirection = directionFromDegrees(game.player.yawDegrees);
                     break;
                 case 'e':
                 case 'E':
@@ -574,10 +722,39 @@ int runInteractive(const Options& options, const Grid& map, const RenderAssets& 
         input.turn = clampd(turnStep / safeDelta, -1.0, 1.0);
         input.shoot = shootRequested;
         input.enterExit = enterRequested;
+        input.dash = dashRequested;
+        input.dashDirection = dashDirection;
         shootRequested = false;
         enterRequested = false;
+        dashRequested = false;
+        dashDirection = Vec2{};
 
         updateGame(game, input, deltaSeconds);
+
+        bool dashSound = false;
+        bool impactSound = false;
+        bool killSound = false;
+        for (SoundEvent event : game.soundEvents) {
+            if (event == SoundEvent::Dash) {
+                dashSound = true;
+            } else if (event == SoundEvent::Impact) {
+                impactSound = true;
+            } else if (event == SoundEvent::Kill) {
+                killSound = true;
+            }
+        }
+        game.soundEvents.clear();
+        std::string sound;
+        if (!options.noSound) {
+            if (dashSound) {
+                sound += '\a';
+            }
+            if (impactSound) {
+                sound += "\a\a";
+            } else if (killSound) {
+                sound += '\a';
+            }
+        }
 
         const auto [columns, rows] = terminalSize();
         const int width = std::clamp(columns, 20, 400);
@@ -588,31 +765,44 @@ int runInteractive(const Options& options, const Grid& map, const RenderAssets& 
         frameOptions.mapView = mapView;
         frameOptions.minimap = minimap;
         frameOptions.firing = game.muzzleFlash > 0.0;
+        frameOptions.impactDemo = options.impactDemo;
         frameOptions.fovDegrees = options.fovDegrees;
         renderGameFrame(image, game, assets, frameOptions);
 
-        std::string output = renderTerminalFrame(image);
+        std::string output = sound + renderTerminalFrame(image);
         char status[512];
         if (game.playerDead) {
             std::snprintf(status, sizeof(status),
-                          "  museum3d | YOU DIED - press R to restart | kills=%d | Q quit",
-                          game.kills);
+                          "  museum3d | YOU DIED - press R to restart | score %d | "
+                          "kills=%d | Q quit",
+                          game.score, game.kills);
         } else if (mapView) {
             std::snprintf(status, sizeof(status),
-                          "  museum3d | overhead 3D map | Tab 3D view | M minimap | "
-                          "R restart | Q quit");
+                          "  museum3d | overhead 3D map | score %d | kills %d | "
+                          "Tab 3D view | M minimap | R restart | Q quit",
+                          game.score, game.kills);
         } else if (game.player.inVehicle) {
             const Vehicle& vehicle =
                 game.vehicles[static_cast<std::size_t>(game.player.vehicleIndex)];
             std::snprintf(status, sizeof(status),
-                          "  museum3d | DRIVING | HP %d | speed %4.1f | kills %d | "
-                          "fps=%.0f | W/S throttle, A/D steer, E exit, Tab map, Q quit",
-                          game.player.health, vehicle.speed, game.kills, displayedFps);
+                          "  museum3d | DRIVING | HP %d | speed %4.1f | score %d | "
+                          "kills %d | fps=%.0f | W/S throttle, A/D steer, ram "
+                          "zombies, E exit, Q quit",
+                          game.player.health, vehicle.speed, game.score, game.kills,
+                          displayedFps);
         } else {
+            char dashState[24] = "READY";
+            if (game.player.dashTimer > 0.0) {
+                std::snprintf(dashState, sizeof(dashState), "ACTIVE");
+            } else if (!dashReady(game)) {
+                std::snprintf(dashState, sizeof(dashState), "%.1fs",
+                              game.player.dashCooldown);
+            }
             std::snprintf(status, sizeof(status),
-                          "  museum3d | HP %d | kills %d | fps=%.0f | WASD move, E enter "
-                          "vehicle, Space shoot, Tab map, M minimap, R restart, Q quit",
-                          game.player.health, game.kills, displayedFps);
+                          "  museum3d | HP %d | score %d | dash %s | kills %d | "
+                          "fps=%.0f | Shift+WASD/F dash, Space shoot, E vehicle, Q quit",
+                          game.player.health, game.score, dashState, game.kills,
+                          displayedFps);
         }
         std::string statusLine = status;
         if (static_cast<int>(statusLine.size()) > columns) {
@@ -685,15 +875,23 @@ int main(int argc, char** argv) {
                      options.driveVehicle, static_cast<int>(game.vehicles.size()));
         return 1;
     }
-    if (options.driveVehicle >= 0 && !startInVehicle(game, options.driveVehicle)) {
-        std::fprintf(stderr, "error: vehicle %d cannot be entered\n", options.driveVehicle);
-        return 1;
-    }
-    if (options.driveVehicle < 0 &&
-        !isWalkableCentered(map, options.position, kPlayerRadius)) {
-        std::fprintf(stderr, "error: start position %.2f,%.2f is not walkable\n",
-                     options.position.x, options.position.y);
-        return 1;
+    if (options.dashDemo) {
+        setupDashDemo(game);
+    } else if (options.impactDemo) {
+        setupImpactDemo(game);
+    } else {
+        if (options.driveVehicle >= 0 &&
+            !startInVehicle(game, options.driveVehicle)) {
+            std::fprintf(stderr, "error: vehicle %d cannot be entered\n",
+                         options.driveVehicle);
+            return 1;
+        }
+        if (options.driveVehicle < 0 &&
+            !isWalkableCentered(map, options.position, kPlayerRadius)) {
+            std::fprintf(stderr, "error: start position %.2f,%.2f is not walkable\n",
+                         options.position.x, options.position.y);
+            return 1;
+        }
     }
 
     RenderAssets assets;
@@ -705,6 +903,7 @@ int main(int argc, char** argv) {
         frameOptions.mapView = options.mapView;
         frameOptions.minimap = options.minimap;
         frameOptions.firing = false;
+        frameOptions.impactDemo = options.impactDemo;
         frameOptions.fovDegrees = options.fovDegrees;
         renderGameFrame(image, game, assets, frameOptions);
         if (!writePPM(options.renderPath, image)) {

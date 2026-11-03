@@ -11,5 +11,6 @@ void drawHealthBar(Image& image, int x, int y, int width, int height,
 void drawPlayerHud(Image& image, const Game& game);
 void drawCrosshair(Image& image, bool firing);
 void drawMinimap(Image& image, const Game& game);
+void drawDashEffects(Image& image, const Game& game);
 
 }  // namespace g3d
